@@ -1,0 +1,19 @@
+# Secrets y archivos sensibles
+*.key
+*.crt
+*.pem
+secrets.yaml
+*-secret.yaml
+
+# Archivos temporales
+*.tmp
+*.swp
+*~
+
+# Configuraciones locales
+.kube/
+kubeconfig
+.env
+
+# macOS
+.DS_Store
