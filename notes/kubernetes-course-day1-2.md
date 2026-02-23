@@ -1,6 +1,6 @@
 # Curso de Kubernetes - Apuntes Consolidados
 
-## Días 1, 2, 3 y 4 - Fundamentos, Deployments y Configuración
+## Días 1, 2, 3, 4 y 5 - Fundamentos, Deployments, ConfigMaps y Services
 
 ---
 
@@ -32,10 +32,19 @@
 19. [Desplegando el Crawler](#19-desplegando-el-crawler)
 20. [env vs envFrom](#20-env-vs-envfrom)
 
+### Día 5 - Services y Networking
+21. [Services - Endpoints Estables](#21-services---endpoints-estables)
+22. [Service Types - Tipos de Servicios](#22-service-types---tipos-de-servicios)
+23. [API Service - NodePort](#23-api-service---nodeport)
+24. [Crawler Service - ClusterIP](#24-crawler-service---clusterip)
+25. [Distribución de IPs en Kubernetes](#25-distribución-de-ips-en-kubernetes)
+26. [Change API Service](#26-change-api-service)
+27. [Cómo se Crean los Pods](#27-cómo-se-crean-los-pods)
+
 ### Referencia
-21. [Consultas Teóricas Frecuentes](#21-consultas-teóricas-frecuentes)
-22. [Glosario de Términos](#22-glosario-de-términos)
-23. [Comandos Útiles](#23-comandos-útiles)
+28. [Consultas Teóricas Frecuentes](#28-consultas-teóricas-frecuentes)
+29. [Glosario de Términos](#29-glosario-de-términos)
+30. [Comandos Útiles](#30-comandos-útiles)
 
 ---
 
@@ -2498,7 +2507,1201 @@ kubectl exec <pod-name> -- env | grep CRAWLER
 
 ---
 
-## 21. Consultas Teóricas Frecuentes
+## 21. Services - Endpoints Estables
+
+### Introducción
+
+Hemos iniciado pods y nos hemos conectado a ellos individualmente, pero eso francamente no es súper útil si queremos distribuir tráfico real a través de esos pods. Ahí es donde entran los servicios.
+
+Los **Services** proporcionan un endpoint estable para los pods. Son una abstracción usada para proporcionar un endpoint estable y balancear la carga de tráfico a través de un grupo de Pods. Por "endpoint estable", simplemente quiero decir que el servicio siempre estará disponible en una URL dada, incluso si el pod es destruido y recreado.
+
+---
+
+### Crear un Service para Web
+
+**Preparación - Escalar a 3 réplicas:**
+```bash
+kubectl scale deployment synergychat-web --replicas=3
+```
+
+**Archivo `web-service.yaml`:**
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+spec:
+  selector:
+    app: synergychat-web
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+```
+
+**Aplicar:**
+```bash
+kubectl apply -f web-service.yaml
+```
+
+---
+
+### ¿Qué hace este Service?
+
+Esto crea un nuevo servicio llamado `web-service` con algunas propiedades:
+
+- **Escucha en el puerto `80`** para tráfico entrante
+- **Reenvía ese tráfico a pods** que están escuchando en su puerto `8080`
+- **Su controlador** continuamente escanea pods que coincidan con el selector de label `app: synergychat-web` y automáticamente los agrega a su pool
+
+---
+
+### Verificar el Service
+
+```bash
+kubectl get services
+# o abreviado:
+kubectl get svc
+```
+
+**Salida esperada:**
+```
+NAME          TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+kubernetes    ClusterIP   10.96.0.1       <none>        443/TCP   5d
+web-service   ClusterIP   10.96.123.45    <none>        80/TCP    10s
+```
+
+---
+
+### Port Forward al Service
+
+**Diferencia clave:**
+```bash
+# Antes (port-forward a un pod específico):
+kubectl port-forward pod/synergychat-web-xxxxx 8080:8080
+
+# Ahora (port-forward al servicio):
+kubectl port-forward service/web-service 8080:80
+```
+
+**Ejecutar:**
+```bash
+kubectl port-forward service/web-service 8080:80
+```
+
+Abre `http://localhost:8080` en tu navegador. ¡Las solicitudes están siendo **balanceadas** a través de 3 pods!
+
+---
+
+### Diferencia: Port-forward a Pod vs Service
+
+| Port-forward a Pod                    | Port-forward a Service                |
+|---------------------------------------|---------------------------------------|
+| Conecta a UN pod específico           | Conecta al Service (load balancer)    |
+| Si el pod muere, pierdes conexión     | Si un pod muere, sigue funcionando    |
+| Sin balanceo de carga                 | ✅ Balanceo de carga entre pods       |
+| `kubectl port-forward pod/nombre ...` | `kubectl port-forward service/nombre ...` |
+
+---
+
+### ¿Cómo funciona el balanceo de carga?
+
+```
+Usuario → service/web-service:80
+              ↓
+         (Load Balancer)
+              ↓
+    ┌─────────┼─────────┐
+    ↓         ↓         ↓
+  Pod 1     Pod 2     Pod 3
+  :8080     :8080     :8080
+```
+
+---
+
+### Anatomía del Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service        # Nombre del servicio
+spec:
+  selector:                # ¿Qué pods gestionar?
+    app: synergychat-web   # Pods con este label
+  ports:                   # Configuración de puertos
+  - protocol: TCP          # Protocolo
+    port: 80               # Puerto del servicio
+    targetPort: 8080       # Puerto del pod
+```
+
+---
+
+### Ver Endpoints del Service
+
+Los **endpoints** muestran qué pods están detrás del servicio:
+
+```bash
+kubectl get endpoints web-service
+```
+
+**Salida esperada:**
+```
+NAME          ENDPOINTS                                      AGE
+web-service   10.244.0.5:8080,10.244.0.6:8080,10.244.0.7:8080   2m
+```
+
+---
+
+### Conceptos Importantes
+
+**Service:**
+- Abstracción que proporciona un endpoint estable
+- Balancea carga automáticamente entre pods
+- Sobrevive a la muerte/recreación de pods
+
+**Selector:**
+- Define qué pods pertenecen al servicio
+- Usa labels para identificar pods
+- Actualización automática cuando pods cambian
+
+**Port Mapping:**
+- `port`: Puerto donde el servicio escucha (externo al pod)
+- `targetPort`: Puerto donde el pod escucha (interno al pod)
+- Pueden ser diferentes (ej: servicio:80 → pod:8080)
+
+---
+
+### Comandos Útiles
+
+```bash
+# Ver servicios
+kubectl get services
+kubectl get svc
+
+# Describir un servicio
+kubectl describe service web-service
+
+# Ver endpoints (pods asociados)
+kubectl get endpoints web-service
+
+# Ver en formato YAML
+kubectl get service web-service -o yaml
+
+# Port-forward a un servicio
+kubectl port-forward service/web-service 8080:80
+
+# Eliminar un servicio
+kubectl delete service web-service
+```
+
+**📚 Documentación oficial:**
+- Services: https://kubernetes.io/docs/concepts/services-networking/service/
+
+---
+
+## 22. Service Types - Tipos de Servicios
+
+### Inspeccionar tu Service
+
+```bash
+kubectl get svc web-service -o yaml
+```
+
+**Verás algo como:**
+```yaml
+spec:
+  clusterIP: 10.96.213.234
+  ...
+  type: ClusterIP
+```
+
+---
+
+### ¿Por qué ClusterIP?
+
+**¡No especificamos un tipo de servicio!** Es porque `ClusterIP` es el **tipo de servicio por defecto**.
+
+El `clusterIP` es la dirección IP a la que el servicio está vinculado en la red interna de Kubernetes.
+
+---
+
+### Tipos de Services
+
+#### 1. ClusterIP (Por Defecto)
+
+**Características:**
+- Expone el servicio en una IP interna del clúster
+- Solo accesible desde **dentro** del clúster
+- No accesible desde internet o tu laptop (sin port-forward)
+
+**Cuándo usar:**
+- Servicios internos (microservicios que se hablan entre sí)
+- Bases de datos internas
+- APIs internas
+
+**Ejemplo:**
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+spec:
+  type: ClusterIP  # ← Opcional (es el default)
+  selector:
+    app: synergychat-web
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+---
+
+#### 2. NodePort
+
+**Características:**
+- Expone el servicio en la IP de **cada nodo** en un puerto estático
+- Accesible desde fuera del clúster usando `<NodeIP>:<NodePort>`
+- Es un `ClusterIP` **+ exposición en nodos**
+
+**Cuándo usar:**
+- Desarrollo/testing
+- Cuando no tienes un load balancer cloud
+- Acceso directo a servicios
+
+**Ejemplo:**
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: synergychat-web
+  ports:
+  - port: 80
+    targetPort: 8080
+    nodePort: 30080  # Puerto en cada nodo (30000-32767)
+```
+
+**Acceso:**
+```
+http://<IP-del-Nodo>:30080
+```
+
+---
+
+#### 3. LoadBalancer
+
+**Características:**
+- Crea un **load balancer externo** en el cloud (AWS, GCP, Azure)
+- Asigna una IP externa fija al servicio
+- Es un `NodePort` **+ load balancer cloud**
+
+**Cuándo usar:**
+- Producción en la nube
+- Cuando quieres exposición externa automática
+- Distribución de tráfico entre nodos
+
+**Ejemplo:**
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service-lb
+spec:
+  type: LoadBalancer
+  selector:
+    app: synergychat-web
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+**Nota:** En Minikube no funciona igual (no estás en cloud real).
+
+---
+
+#### 4. ExternalName
+
+**Características:**
+- **Redirección DNS** solamente
+- Mapea el servicio a un hostname externo
+- No hace proxy, solo DNS CNAME
+- Es completamente diferente a los otros tipos
+
+**Cuándo usar:**
+- Migración a servicios externos
+- Acceso a servicios fuera del clúster con nombre consistente
+
+**Ejemplo:**
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-api
+spec:
+  type: ExternalName
+  externalName: api.example.com  # DNS externo
+```
+
+---
+
+### Jerarquía de Tipos (Construcción Incremental)
+
+```
+ClusterIP (base)
+    ↓
+    + Exposición en nodos
+    ↓
+NodePort
+    ↓
+    + Load balancer externo
+    ↓
+LoadBalancer
+```
+
+**ExternalName** está completamente separado (solo DNS).
+
+---
+
+### Comparación de Tipos
+
+| Tipo          | Acceso                    | IP Pública | Uso Principal              |
+|---------------|---------------------------|------------|----------------------------|
+| ClusterIP     | Solo dentro del clúster   | ❌         | Servicios internos         |
+| NodePort      | Nodos + dentro            | ❌         | Dev/testing                |
+| LoadBalancer  | Internet + nodos + dentro | ✅         | Producción cloud           |
+| ExternalName  | Redirección DNS           | N/A        | Migración/servicios externos |
+
+---
+
+### Pregunta: ¿Cuál es falso?
+
+❌ **FALSO: An ExternalName service has the functionality of all the other types combined**
+
+**Explicación:**
+
+ExternalName es completamente DIFERENTE a los otros tipos:
+- Solo hace redirección DNS (CNAME)
+- NO crea ClusterIP
+- NO crea NodePort
+- NO hace proxy de tráfico
+
+Los otros tipos SÍ construyen incrementalmente:
+- ✅ NodePort crea ClusterIP interno
+- ✅ LoadBalancer expone NodePorts
+- ✅ ClusterIP solo expone internamente
+
+---
+
+### Conceptos Clave
+
+- **ClusterIP** = Tipo por defecto, solo interno
+- **NodePort** = ClusterIP + puerto en cada nodo
+- **LoadBalancer** = NodePort + load balancer cloud
+- **ExternalName** = Redirección DNS (caso especial)
+- Los tipos se **construyen incrementalmente** unos sobre otros
+- Elige según **dónde necesitas acceso** (interno vs externo)
+
+**📚 Documentación oficial:**
+- Service Types: https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types
+
+---
+
+## 23. API Service - NodePort
+
+### Crear API Service con NodePort
+
+**Archivo `api-service.yaml`:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  type: NodePort
+  selector:
+    app: synergychat-api
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+    nodePort: 30080
+```
+
+---
+
+### Explicación de los campos
+
+```yaml
+spec:
+  type: NodePort             # Tipo de servicio (expone en nodos)
+  
+  selector:
+    app: synergychat-api     # Selecciona pods con este label
+  
+  ports:
+  - protocol: TCP            # Protocolo
+    port: 80                 # Puerto del servicio (interno)
+    targetPort: 8080         # Puerto del pod (donde escucha la API)
+    nodePort: 30080          # Puerto expuesto en cada nodo (30000-32767)
+```
+
+---
+
+### Flujo de tráfico
+
+```
+Externo → Nodo:30080
+              ↓
+          Service:80
+              ↓
+          Pod:8080
+```
+
+---
+
+### Aplicar y verificar
+
+```bash
+kubectl apply -f api-service.yaml
+kubectl get svc
+```
+
+**Salida esperada:**
+```
+NAME          TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+web-service   ClusterIP   10.96.213.234   <none>        80/TCP         10m
+api-service   NodePort    10.96.145.67    <none>        80:30080/TCP   5s
+```
+
+**Observa:**
+- **TYPE:** `NodePort`
+- **PORT(S):** `80:30080/TCP` (servicio:nodePort)
+
+---
+
+### Acceder al API Service
+
+**Con Minikube:**
+```bash
+minikube ip  # Obtener IP del nodo
+# Ejemplo: 192.168.49.2
+
+curl http://192.168.49.2:30080
+
+# O usar atajo de Minikube:
+minikube service api-service
+```
+
+---
+
+### Rango de NodePort
+
+**NodePort válidos:** 30000-32767
+
+**Ejemplos:**
+```yaml
+nodePort: 30000  # ✅ Válido
+nodePort: 30080  # ✅ Válido
+nodePort: 32767  # ✅ Válido (máximo)
+nodePort: 8080   # ❌ Inválido (fuera de rango)
+```
+
+**📚 Documentación oficial:**
+- NodePort: https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport
+
+---
+
+## 24. Crawler Service - ClusterIP
+
+### Crear Crawler Service
+
+El servicio `crawler` solo necesita estar disponible para el servicio `api` (interno al clúster).
+
+**Archivo `crawler-service.yaml`:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: crawler-service
+spec:
+  selector:
+    app: synergychat-crawler
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+```
+
+**Nota:** `type: ClusterIP` es opcional (es el default).
+
+---
+
+### ¿Por qué ClusterIP?
+
+**El crawler es un servicio interno:**
+- Solo necesita ser accesible por el servicio `api`
+- NO necesita ser accesible desde fuera del clúster
+- NO necesita NodePort o LoadBalancer
+
+**Comunicación interna:**
+```
+api-service
+    ↓ (hace request a)
+crawler-service:80
+    ↓
+crawler pod:8080
+```
+
+---
+
+### Aplicar y verificar
+
+```bash
+kubectl apply -f crawler-service.yaml
+kubectl get svc
+```
+
+**Salida esperada:**
+```
+NAME              TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+web-service       ClusterIP   10.96.213.234   <none>        80/TCP         20m
+api-service       NodePort    10.96.145.67    <none>        80:30080/TCP   10m
+crawler-service   ClusterIP   10.96.178.92    <none>        80/TCP         5s
+```
+
+---
+
+### Verificar Endpoints
+
+```bash
+kubectl get endpoints crawler-service
+```
+
+**Salida esperada:**
+```
+NAME              ENDPOINTS         AGE
+crawler-service   10.244.0.8:8080   10s
+```
+
+---
+
+### Resumen de Servicios Creados
+
+| Servicio        | Tipo      | Propósito                            |
+|-----------------|-----------|--------------------------------------|
+| web-service     | ClusterIP | Balanceo entre pods web (interno)    |
+| api-service     | NodePort  | Exponer API al exterior              |
+| crawler-service | ClusterIP | Comunicación API → Crawler (interno) |
+
+---
+
+### Arquitectura de Servicios
+
+```
+                    FUERA DEL CLÚSTER
+                           |
+                           ↓
+                    api-service:30080 (NodePort)
+                           |
+    ┌──────────────────────┴──────────────────────┐
+    |              DENTRO DEL CLÚSTER             |
+    |                                             |
+    |  web-service:80        api-service:80       |
+    |  (ClusterIP)           (ClusterIP)          |
+    |       ↓                     ↓                |
+    |  web pods (3x)         api pod (1x)         |
+    |                             ↓                |
+    |                    crawler-service:80        |
+    |                    (ClusterIP)               |
+    |                             ↓                |
+    |                    crawler pod (1x)          |
+    └─────────────────────────────────────────────┘
+```
+
+---
+
+### Comunicación Entre Servicios
+
+**Dentro del clúster, los servicios se comunican usando sus nombres:**
+
+```bash
+# Desde el pod de la API, hacer request al crawler:
+curl http://crawler-service:80
+
+# Kubernetes resuelve automáticamente:
+# crawler-service → 10.96.178.92:80
+```
+
+---
+
+### Conceptos Clave
+
+**ClusterIP (web y crawler):**
+- Solo accesible dentro del clúster
+- Ideal para servicios internos
+- Comunicación entre microservicios
+
+**NodePort (api):**
+- Accesible desde fuera del clúster
+- Expone puerto en cada nodo
+- Para que clientes externos accedan
+
+**Descubrimiento de Servicios:**
+- Los servicios se llaman por nombre: `http://crawler-service`
+- Kubernetes DNS resuelve automáticamente
+- No necesitas IPs hardcoded
+
+**📚 Documentación oficial:**
+- DNS for Services: https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/
+
+---
+
+## 25. Distribución de IPs en Kubernetes
+
+### Tipos de IPs en Kubernetes
+
+Hay **3 tipos diferentes de IPs** en juego:
+
+1. **Cluster-IP (IP del Servicio)** - Virtual y estable
+2. **Pod IP (IP del Endpoint)** - Real y efímera
+3. **Node IP (IP del Nodo)** - Infraestructura física
+
+---
+
+### 1️⃣ Cluster-IP (IP del Servicio)
+
+**Qué es:**
+- IP **virtual** asignada al **Service**
+- Única y estable durante la vida del servicio
+- Solo accesible **dentro del clúster**
+
+**Ejemplo:**
+```
+api-service       → 10.96.144.49
+crawler-service   → 10.98.130.138
+web-service       → 10.107.211.19
+```
+
+**Rango de IPs:**
+- Usualmente: `10.96.x.x`, `10.98.x.x`, `10.107.x.x`
+- Configurado en el clúster (Service CIDR)
+- **Asignadas automáticamente** por Kubernetes
+
+---
+
+### 2️⃣ Pod IP (Endpoint IP)
+
+**Qué es:**
+- IP **real** del **Pod**
+- Asignada cuando el pod se crea
+- **Cambia** si el pod se recrea
+
+**Ejemplo:**
+```
+Endpoints: 10.244.0.59:8080
+```
+
+Esta es la IP del **pod del crawler**, no del servicio.
+
+**Rango:**
+- Pod IPs: `10.244.x.x` (Pod CIDR)
+- Diferente al rango de Services
+
+---
+
+### 3️⃣ Node IP (IP del Nodo)
+
+**Qué es:**
+- IP de la **máquina física/virtual** donde corre Kubernetes
+- En Minikube es la IP de la VM de Minikube
+
+**Verificar:**
+```bash
+minikube ip
+```
+
+**Ejemplo:**
+```
+192.168.49.2
+```
+
+---
+
+### Diagrama Completo de IPs
+
+```
+┌─────────────────────────────────────────┐
+│         MINIKUBE NODE (VM)              │
+│         IP: 192.168.49.2                │
+│                                         │
+│  ┌──────────────────────────────────┐  │
+│  │  SERVICES (ClusterIPs)           │  │
+│  │                                  │  │
+│  │  crawler-service → 10.98.130.138 │  │
+│  │  api-service     → 10.96.144.49  │  │
+│  │  web-service     → 10.107.211.19 │  │
+│  └────────────┬─────────────────────┘  │
+│               ↓ (enrutan a)            │
+│  ┌──────────────────────────────────┐  │
+│  │  PODS (IPs Reales)               │  │
+│  │                                  │  │
+│  │  crawler-pod  → 10.244.0.59:8080 │  │
+│  │  api-pod      → 10.244.0.45:8080 │  │
+│  │  web-pod-1    → 10.244.0.12:8080 │  │
+│  └──────────────────────────────────┘  │
+└─────────────────────────────────────────┘
+```
+
+---
+
+### Flujo de una Request
+
+**Desde dentro del clúster:**
+```
+api-pod quiere hablar con crawler-pod
+        ↓
+curl http://crawler-service:80
+        ↓
+DNS resuelve: crawler-service → 10.98.130.138
+        ↓
+Request va a: 10.98.130.138:80 (ClusterIP)
+        ↓
+kube-proxy enruta a: 10.244.0.59:8080 (Pod IP)
+        ↓
+crawler-pod recibe la request
+```
+
+---
+
+### Resumen de Rangos de IP
+
+| Tipo               | Rango Ejemplo    | Propósito                              |
+|--------------------|------------------|----------------------------------------|
+| **Node IP**        | 192.168.49.x     | IP de la máquina/VM                    |
+| **Service IP**     | 10.96.x.x        | IP virtual del servicio (ClusterIP)    |
+|                    | 10.98.x.x        |                                        |
+|                    | 10.107.x.x       |                                        |
+| **Pod IP**         | 10.244.x.x       | IP real del pod                        |
+
+---
+
+### ¿Por qué diferentes rangos?
+
+**Separación lógica:**
+
+1. **Service IPs** (virtuales y estables)
+   - NO cambian aunque los pods mueran
+   - Balanceo de carga automático
+
+2. **Pod IPs** (reales y efímeras)
+   - Cambian cuando el pod se recrea
+   - Comunicación directa pod-a-pod
+
+3. **Node IPs** (infraestructura)
+   - Para acceso externo
+
+---
+
+### Verificar todas las IPs
+
+```bash
+# 1. IPs de Servicios (ClusterIPs)
+kubectl get svc -o wide
+
+# 2. IPs de Pods
+kubectl get pods -o wide
+
+# 3. IP del Nodo (Minikube)
+minikube ip
+
+# 4. Endpoints (qué pod está detrás de cada servicio)
+kubectl get endpoints
+```
+
+---
+
+### Ejemplo práctico
+
+**Crawler Service:**
+```
+Service IP:    10.98.130.138:80    ← IP virtual (estable)
+    ↓ (enruta a)
+Endpoint IP:   10.244.0.59:8080    ← IP del pod (cambia si se recrea)
+```
+
+**Si eliminas el pod del crawler:**
+
+```
+Service IP:    10.98.130.138:80    ← MISMA (no cambia) ✅
+    ↓
+Endpoint IP:   10.244.0.61:8080    ← NUEVA (cambió) ⚠️
+```
+
+**Por eso usamos servicios** - la IP del servicio es estable aunque los pods cambien.
+
+---
+
+### Conceptos Clave
+
+1. **Service ClusterIP** = IP virtual y estable del servicio
+2. **Pod IP (Endpoint)** = IP real del pod (efímera)
+3. **Node IP** = IP de la máquina física/VM
+4. **Diferentes rangos** = Separación lógica de redes
+5. **Los servicios abstraen** la IP del pod (por eso son útiles)
+
+---
+
+## 26. Change API Service
+
+### Cambiando de NodePort a ClusterIP
+
+En la mayoría de los entornos de Kubernetes basados en la nube, usarás un objeto **Gateway** para exponer servicios. El Gateway no solo expone servicios, sino que también permite:
+
+* Alojar múltiples servicios en la misma dirección IP
+* Alojar múltiples servicios en el mismo puerto (enrutamiento basado en rutas)
+* Terminar SSL
+* Integrar directamente con DNS externo y load balancers
+
+Porque configuraremos un Gateway en el próximo capítulo, no hay razón para exponer el servicio de la API con `NodePort`. Cambiémoslo de vuelta a `ClusterIP`.
+
+---
+
+### Editar api-service.yaml
+
+**Antes (NodePort):**
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  type: NodePort          # ← Eliminar
+  selector:
+    app: synergychat-api
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+    nodePort: 30080       # ← Eliminar
+```
+
+**Después (ClusterIP):**
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  selector:
+    app: synergychat-api
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+```
+
+---
+
+### Aplicar cambios
+
+```bash
+kubectl apply -f api-service.yaml
+```
+
+**Salida esperada:**
+```
+service/api-service configured
+```
+
+---
+
+### Verificar el cambio
+
+```bash
+kubectl get svc
+```
+
+**Salida esperada:**
+```
+NAME              TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+api-service       ClusterIP   10.96.144.49    <none>        80/TCP    15m
+crawler-service   ClusterIP   10.98.130.138   <none>        80/TCP    5m
+web-service       ClusterIP   10.107.211.19   <none>        80/TCP    25m
+```
+
+**Todos los servicios ahora son ClusterIP.**
+
+---
+
+### Estado Actual
+
+**Arquitectura:**
+```
+┌────────────────────────────────────────┐
+│      DENTRO DEL CLÚSTER                │
+│                                        │
+│  web-service:80 (ClusterIP)            │
+│  api-service:80 (ClusterIP)            │
+│  crawler-service:80 (ClusterIP)        │
+└────────────────────────────────────────┘
+```
+
+---
+
+### ¿Por qué este cambio?
+
+**Gateway es mejor para producción:**
+
+**Antes (múltiples NodePorts):**
+```
+Internet → NodePort1:30080
+Internet → NodePort2:30081
+Internet → NodePort3:30082
+```
+
+**Con Gateway (próximo capítulo):**
+```
+Internet → Gateway (único punto)
+   ↓
+/api/*  → api-service (ClusterIP)
+/web/*  → web-service (ClusterIP)
+```
+
+---
+
+### Ventajas del Gateway
+
+- Múltiples servicios en la misma IP
+- Enrutamiento basado en paths
+- Terminación SSL/TLS automática
+- Integración con DNS externo
+- Más seguro (menos superficie de ataque)
+
+---
+
+### Conceptos Clave
+
+**Gateway (próximo capítulo):**
+- Reemplazo moderno de Ingress
+- Punto único de entrada al clúster
+- Enrutamiento avanzado
+- Gestión de SSL/TLS
+
+**Por qué ClusterIP internamente:**
+- Servicios internos no necesitan exposición directa
+- Gateway maneja toda la exposición externa
+- Más seguro y flexible
+
+**📚 Documentación oficial:**
+- Gateway API: https://gateway-api.sigs.k8s.io/
+
+---
+
+## 27. Cómo se Crean los Pods
+
+### Respuesta Corta
+
+**Normalmente NO creas pods directamente.** Creas un **Deployment**, y el Deployment crea automáticamente los pods por ti.
+
+---
+
+### Formas de Crear Pods
+
+#### ❌ 1. Crear Pod Directamente (NO recomendado)
+
+**Comando imperativo:**
+```bash
+kubectl run mi-pod --image=nginx
+```
+
+**¿Por qué NO se recomienda?**
+- Si el pod muere, NO se recrea automáticamente
+- No hay escalado
+- No hay actualizaciones rolling
+- No hay auto-sanación
+
+---
+
+#### ✅ 2. Crear Pod vía Deployment (RECOMENDADO)
+
+**Con archivo YAML:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mi-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mi-app
+  template:           # ← Aquí defines cómo será el pod
+    metadata:
+      labels:
+        app: mi-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+```
+
+```bash
+kubectl apply -f deployment.yaml
+```
+
+---
+
+### Flujo de Creación
+
+```
+1. Tú creas un Deployment
+   ↓
+   kubectl apply -f deployment.yaml
+
+2. El Deployment crea un ReplicaSet
+   ↓
+   Deployment Controller
+
+3. El ReplicaSet crea los Pods
+   ↓
+   ReplicaSet Controller
+
+4. Los Pods se ejecutan en los Nodos
+   ↓
+   Kubelet (agente en el nodo)
+```
+
+---
+
+### Ejemplo: Synergychat-web
+
+**Cuando ejecutaste:**
+```bash
+kubectl create deployment synergychat-web --image=bootdotdev/synergychat-web:latest
+```
+
+**Proceso:**
+
+1. Se creó el **Deployment**: `synergychat-web`
+2. El Deployment creó un **ReplicaSet**: `synergychat-web-679cbcc6cd`
+3. El ReplicaSet creó el **Pod**: `synergychat-web-679cbcc6cd-abc12`
+
+---
+
+### Verificar el Flujo
+
+```bash
+# 1. Ver el Deployment
+kubectl get deployments
+
+# 2. Ver el ReplicaSet (creado automáticamente)
+kubectl get replicasets
+
+# 3. Ver los Pods (creados automáticamente)
+kubectl get pods
+```
+
+---
+
+### La Sección `template` en el Deployment
+
+**Esta sección define CÓMO será el pod:**
+
+```yaml
+spec:
+  replicas: 3
+  template:              # ← Template del Pod
+    metadata:
+      labels:
+        app: synergychat-web
+    spec:                # ← Especificación del Pod
+      containers:        # ← Contenedores del Pod
+      - name: web
+        image: bootdotdev/synergychat-web:latest
+        ports:
+        - containerPort: 8080
+```
+
+---
+
+### ¿Qué pasa cuando escalas?
+
+```bash
+kubectl scale deployment synergychat-web --replicas=5
+```
+
+**Proceso:**
+1. Actualizas el Deployment (replicas: 5)
+2. El Deployment actualiza el ReplicaSet (desired: 5)
+3. El ReplicaSet **crea 2 pods adicionales** automáticamente
+
+---
+
+### ¿Qué pasa cuando eliminas un Pod?
+
+```bash
+kubectl delete pod synergychat-web-679cbcc6cd-abc12
+```
+
+**Proceso:**
+1. El pod es eliminado
+2. El ReplicaSet detecta: "Tengo 2 pods, pero necesito 3"
+3. El ReplicaSet **crea un nuevo pod automáticamente**
+4. El nuevo pod tiene un nombre diferente
+
+---
+
+### Comparación Visual
+
+**Sin Deployment (Pod directo):**
+```
+Tú → Creas Pod → Pod corre
+              ↓
+         Pod muere
+              ↓
+          Se acabó ❌
+```
+
+**Con Deployment:**
+```
+Tú → Creas Deployment → ReplicaSet → Pods
+                            ↓
+                     Monitorea constantemente
+                            ↓
+                      Pod muere?
+                            ↓
+                   Crea nuevo pod ✅
+```
+
+---
+
+### Resumen
+
+**El Deployment:**
+- Crea el ReplicaSet
+- El ReplicaSet crea los Pods
+- Si un pod muere, se recrea automáticamente
+- Puedes escalar fácilmente
+- Actualizaciones rolling automáticas
+
+**Todos tus pods fueron creados vía Deployments:**
+- `web-deployment.yaml` → creó pods web
+- `api-deployment.yaml` → creó pods api
+- `crawler-deployment.yaml` → creó pods crawler
+
+**📚 Documentación oficial:**
+- Pods: https://kubernetes.io/docs/concepts/workloads/pods/
+- Deployments: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+
+---
+
+## 28. Consultas Teóricas Frecuentes
 
 ### ¿Por qué necesito Docker corriendo para Minikube?
 
@@ -2990,24 +4193,24 @@ kubectl get pod <nombre-pod> -o yaml
 
 ## Conceptos Clave Aprendidos
 
-1. **Kubernetes** es un sistema de orquestación de contenedores, no un lenguaje de programación
-2. **kubectl** es la herramienta CLI para interactuar con clústeres de Kubernetes
-3. **Minikube** permite ejecutar Kubernetes localmente para aprendizaje y desarrollo
-4. **Pods** son la unidad mínima desplegable y son efímeros (temporales)
+1. **Kubernetes** es un sistema de orquestación de contenedores
+2. **kubectl** es la herramienta CLI para interactuar con clústeres
+3. **Minikube** permite ejecutar Kubernetes localmente
+4. **Pods** son la unidad mínima desplegable y son efímeros
 5. **Deployments** gestionan y mantienen réplicas de Pods
-6. Cada Pod tiene su propia **IP virtual** única dentro del clúster
-7. Los recursos en Kubernetes están en una **red privada** por defecto
-8. Kubernetes resuelve el problema de **gestionar contenedores a escala**
-9. Los Pods son **abstracciones** sobre contenedores que añaden funcionalidad de Kubernetes
+6. **ConfigMaps** gestionan variables de entorno sin reconstruir imágenes
+7. **Services** proporcionan endpoints estables y balanceo de carga
+8. Los recursos en Kubernetes están en una **red privada** por defecto
+9. Kubernetes resuelve el problema de **gestionar contenedores a escala**
 10. El concepto de **inmutabilidad**: reemplazar en lugar de modificar
 
 ---
 
 ## Próximos Pasos
 
-- Continuar con el curso explorando más objetos de Kubernetes
-- Aprender sobre Services para exponer aplicaciones
-- Explorar ConfigMaps y Secrets para configuración
+- Configurar Gateway para exposición externa
+- Aprender sobre Ingress y enrutamiento avanzado
+- Explorar Secrets para datos sensibles
 - Estudiar Volumes para almacenamiento persistente
 - Practicar con escalado horizontal de Pods
 
@@ -3022,14 +4225,26 @@ kubectl get pod <nombre-pod> -o yaml
 
 ---
 
-**Última actualización:** Días 1, 2, 3 y 4 del curso  
+**Última actualización:** Días 1, 2, 3, 4 y 5 del curso  
 **Versión de Kubernetes:** v1.35.0  
 **Versión de Minikube:** v1.38.0  
 **Versión de kubectl:** v1.35.0
 
 ---
 
-**Microservicios desplegados:**
+**Recursos Desplegados:**
+
+**Deployments:**
 - ✅ synergychat-web (3 réplicas)
 - ✅ synergychat-api (1 réplica)
 - ✅ synergychat-crawler (1 réplica)
+
+**Services:**
+- ✅ web-service (ClusterIP)
+- ✅ api-service (ClusterIP)
+- ✅ crawler-service (ClusterIP)
+
+**ConfigMaps:**
+- ✅ synergychat-api-configmap
+- ✅ synergychat-crawler-configmap
+
