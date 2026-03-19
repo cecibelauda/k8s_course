@@ -5163,3 +5163,582 @@ kubectl get pod <nombre-pod> -o yaml
 **Acceso:**
 - 🌐 Web: http://synchat.internal
 - 🌐 API: http://synchatapi.internal
+
+---
+
+## 6. Storage (Almacenamiento)
+
+### 6.1 Filesystem Efímero
+
+Por defecto, los archivos en disco dentro de un contenedor son **efímeros**. Esto presenta problemas para aplicaciones que necesitan guardar datos de larga duración entre reinicios (ej: bases de datos, datos de usuarios).
+
+**Problema principal:**
+- Cuando un pod se elimina, el filesystem se elimina con él
+- Los datos no persisten entre reinicios del pod
+
+**Razones por las que un pod puede eliminarse:**
+- El nodo en el que corre podría fallar
+- Se publicó una nueva versión de la imagen (actualización de código)
+- Un nuevo nodo fue agregado al cluster y el pod fue reprogramado
+- Eliminación manual con `kubectl delete pod`
+
+**Filosofía de Kubernetes:**
+- Los pods deben ser "blank slate" (pizarra en blanco)
+- Esto facilita reproducción y debugging de issues
+- Sin estado desordenado del que preocuparse
+
+**Ejemplo inicial:**
+```yaml
+# api-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: synergychat-api-configmap
+data:
+  API_PORT: "8080"
+  API_DB_FILEPATH: "/var/lib/synergychat/api/db.json"  # Filesystem efímero
+```
+
+**Prueba de pérdida de datos:**
+1. Configurar la app para guardar en filesystem
+2. Crear mensajes
+3. Eliminar el pod
+4. Los mensajes desaparecen cuando el nuevo pod inicia
+
+---
+
+### 6.2 Volúmenes Efímeros (emptyDir)
+
+La abstracción de **volume** en Kubernetes resuelve dos problemas principales:
+1. **Persistencia de datos** (temporal o permanente)
+2. **Compartir datos entre contenedores** en el mismo pod
+
+**emptyDir:**
+- Es un volumen **efímero** (se borra cuando el pod muere)
+- Permite **compartir datos entre contenedores** del mismo pod
+- Es un directorio vacío creado cuando el pod inicia
+- Uso principal: colaboración entre contenedores, NO persistencia
+
+#### Ejemplo: Crawler con 3 contenedores
+
+**Problema a resolver:**
+- Cada crawler almacena datos en memoria
+- Necesitamos que todos los crawlers compartan la misma base de datos
+- Escalar a nivel de contenedor (múltiples contenedores en 1 pod)
+
+**Archivos modificados:**
+
+```yaml
+# crawler-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: synergychat-crawler-config
+data:
+  CRAWLER_KEYWORDS: "fantasy,science,fiction,magic,space,adventure"
+  CRAWLER_DB_PATH: "/cache/db"        # Ruta compartida
+  CRAWLER_PORT_2: "8081"              # Puerto para contenedor 2
+  CRAWLER_PORT_3: "8082"              # Puerto para contenedor 3
+```
+
+```yaml
+# crawler-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: synergychat-crawler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: synergychat-crawler
+  template:
+    metadata:
+      labels:
+        app: synergychat-crawler
+    spec:
+      containers:
+        # Contenedor 1 - usa envFrom
+        - name: synergychat-crawler-1
+          image: bootdotdev/synergychat-crawler:latest
+          envFrom:
+            - configMapRef:
+                name: synergychat-crawler-config
+          volumeMounts:
+            - name: cache-volume
+              mountPath: /cache
+        
+        # Contenedor 2 - usa env individual
+        - name: synergychat-crawler-2
+          image: bootdotdev/synergychat-crawler:latest
+          env:
+            - name: CRAWLER_KEYWORDS
+              valueFrom:
+                configMapKeyRef:
+                  name: synergychat-crawler-config
+                  key: CRAWLER_KEYWORDS
+            - name: CRAWLER_DB_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: synergychat-crawler-config
+                  key: CRAWLER_DB_PATH
+            - name: CRAWLER_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: synergychat-crawler-config
+                  key: CRAWLER_PORT_2
+          volumeMounts:
+            - name: cache-volume
+              mountPath: /cache
+        
+        # Contenedor 3 - usa env individual
+        - name: synergychat-crawler-3
+          image: bootdotdev/synergychat-crawler:latest
+          env:
+            - name: CRAWLER_KEYWORDS
+              valueFrom:
+                configMapKeyRef:
+                  name: synergychat-crawler-config
+                  key: CRAWLER_KEYWORDS
+            - name: CRAWLER_DB_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: synergychat-crawler-config
+                  key: CRAWLER_DB_PATH
+            - name: CRAWLER_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: synergychat-crawler-config
+                  key: CRAWLER_PORT_3
+          volumeMounts:
+            - name: cache-volume
+              mountPath: /cache
+      
+      # Definición del volumen emptyDir
+      volumes:
+        - name: cache-volume
+          emptyDir: {}
+```
+
+**Conceptos clave:**
+
+**Escalado por Pod vs Escalado por Contenedor:**
+
+| Escalado por POD | Escalado por CONTENEDOR |
+|------------------|-------------------------|
+| Múltiples pods, cada uno con 1 contenedor | 1 pod con múltiples contenedores |
+| Alta disponibilidad (si 1 falla, otros siguen) | Si el pod falla, todos los contenedores mueren |
+| No comparten filesystem local | Comparten el mismo volumen |
+| Pueden estar en diferentes nodos | Todos en el mismo nodo |
+| Ejemplo: Web (3 pods × 1 contenedor) | Ejemplo: Crawler (1 pod × 3 contenedores) |
+
+**Cuándo usar cada estrategia:**
+
+**Escalar por POD (más común):**
+- Alta disponibilidad necesaria
+- Distribuir carga en diferentes nodos
+- No necesitan compartir recursos locales
+- Instancias independientes
+
+**Escalar por CONTENEDOR (menos común):**
+- DEBEN compartir el mismo volumen/disco
+- DEBEN compartir la misma red (localhost)
+- Componentes fuertemente acoplados
+- Sidecar patterns (logging, proxy)
+
+**Problema de puertos compartidos:**
+- Pods comparten el mismo namespace de red
+- No pueden vincularse todos al mismo puerto
+- Solución: cada contenedor usa un puerto diferente (8080, 8081, 8082)
+- Solo el primer puerto se expone vía Service
+
+**Comandos útiles:**
+```bash
+# Ver logs de todos los contenedores en un pod
+kubectl logs <podname> --all-containers
+
+# Ver pods con número de contenedores
+kubectl get pods
+# Columna READY muestra: contenedores_listos/contenedores_totales
+# Ejemplo: 3/3 = 3 contenedores listos de 3 totales
+```
+
+---
+
+### 6.3 Volúmenes Persistentes (PVC/PV)
+
+Los **Persistent Volumes** permiten que los datos sobrevivan cuando el pod muere.
+
+#### Conceptos Fundamentales
+
+**Persistent Volume (PV):**
+- Recurso a nivel de **cluster** (no de pod)
+- Es el **almacenamiento real** (disco físico)
+- Se crea por separado del pod y luego se adjunta
+- Similar a un ConfigMap en ese aspecto
+
+**Persistent Volume Claim (PVC):**
+- Es una **solicitud** de almacenamiento
+- Cuando usa aprovisionamiento dinámico, crea automáticamente un PV si no existe uno que coincida
+- El PVC se adjunta al pod, como lo haría un volumen
+
+**Aprovisionamiento:**
+- **Estático**: Creado manualmente por un administrador del cluster
+- **Dinámico**: Creado automáticamente cuando un pod solicita un volumen que no existe
+- **Recomendación**: Usar dinámico (menos trabajo, más flexible, cloud-native)
+
+#### Comparación: emptyDir vs PVC/PV
+
+| Característica | emptyDir | PVC/PV |
+|----------------|----------|---------|
+| **Vida útil** | Muere con el pod | Sobrevive al pod |
+| **Compartir** | Solo dentro del pod | Entre pods (según access mode) |
+| **Uso típico** | Cache temporal | Base de datos, datos de usuario |
+| **Persistencia** | NO | SÍ |
+
+#### Access Modes (Modos de Acceso)
+
+| Modo | Abreviatura | Descripción |
+|------|-------------|-------------|
+| `ReadWriteOnce` | RWO | 1 nodo puede leer/escribir a la vez |
+| `ReadOnlyMany` | ROX | Múltiples nodos solo lectura |
+| `ReadWriteMany` | RWX | Múltiples nodos leer/escribir |
+
+#### Ejemplo: PVC para API
+
+**Archivo creado:**
+
+```yaml
+# api-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: synergychat-api-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce          # 1 nodo puede leer/escribir
+  resources:
+    requests:
+      storage: 1Gi           # Solicita 1 Gigabyte
+```
+
+**Campos explicados:**
+- `kind: PersistentVolumeClaim`: Es una solicitud de almacenamiento
+- `name`: Identificador único para referenciarlo desde pods
+- `accessModes`: Cómo se puede acceder al volumen
+- `storage`: Tamaño solicitado
+
+**Comandos:**
+```bash
+# Aplicar el PVC
+kubectl apply -f api-pvc.yaml
+
+# Ver PVCs
+kubectl get pvc
+# Salida:
+# NAME                  STATUS   VOLUME                    CAPACITY   ACCESS MODES
+# synergychat-api-pvc   Bound    pvc-xxxxx...             1Gi        RWO
+
+# Ver PVs (creados automáticamente)
+kubectl get pv
+# Salida:
+# NAME              CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM
+# pvc-xxxxx...      1Gi        RWO            Delete           Bound    default/synergychat-api-pvc
+
+# Eliminar PVC (también elimina el PV con política Delete)
+kubectl delete pvc synergychat-api-pvc
+
+# Verificar eliminación
+kubectl get pvc
+kubectl get pv
+```
+
+**Flujo de aprovisionamiento dinámico:**
+```
+1. Creas PVC
+   └─> "Necesito 1Gi de almacenamiento"
+
+2. Kubernetes crea PV automáticamente
+   └─> "Creado: disco de 1Gi en el cluster"
+
+3. PVC y PV se enlazan (Bound)
+   └─> STATUS: Bound
+
+4. Pod usa el PVC
+   └─> Los datos se guardan en el PV
+```
+
+---
+
+### 6.4 Adjuntar Persistencia a Pods
+
+Para usar un PVC en un pod, necesitamos:
+1. Referenciar el PVC en la sección `volumes` del deployment
+2. Montar el volumen en el contenedor con `volumeMounts`
+3. Configurar la aplicación para usar la ruta montada
+
+#### Ejemplo: API con PVC
+
+**Archivos modificados:**
+
+```yaml
+# api-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: synergychat-api-configmap
+data:
+  API_PORT: "8080"
+  API_DB_FILEPATH: "/persist/db.json"  # Ruta en el volumen montado
+```
+
+```yaml
+# api-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: synergychat-api
+  labels:
+    app: synergychat-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: synergychat-api
+  template:
+    metadata:
+      labels:
+        app: synergychat-api
+    spec:
+      containers:
+      - name: synergychat-api
+        image: bootdotdev/synergychat-api:latest
+        envFrom:
+          - configMapRef:
+              name: synergychat-api-configmap
+        volumeMounts:
+          - name: synergychat-api-volume    # Nombre local
+            mountPath: /persist              # Ruta en el contenedor
+      volumes:
+        - name: synergychat-api-volume      # Nombre local
+          persistentVolumeClaim:
+            claimName: synergychat-api-pvc  # Referencia al PVC
+```
+
+#### Interacción entre archivos
+
+**Flujo de conexión:**
+```
+ConfigMap (api-configmap.yaml)
+  └─> Define: API_DB_FILEPATH="/persist/db.json"
+      └─> Le dice a la app: "guarda datos aquí"
+
+PVC (api-pvc.yaml)
+  └─> Solicita: 1Gi de almacenamiento
+      └─> Kubernetes crea PV automáticamente
+
+Deployment (api-deployment.yaml)
+  └─> Carga variables del ConfigMap
+  └─> Referencia el PVC en volumes
+  └─> Monta el volumen en /persist
+      └─> La app escribe en /persist/db.json
+          └─> Los datos van al PV (disco real)
+```
+
+**Diagrama de conexiones:**
+```
+┌─────────────────────────────────────┐
+│         DEPLOYMENT                  │
+│  ┌──────────────────────────────┐  │
+│  │    CONTAINER (api)           │  │
+│  │  Variables de entorno:       │  │
+│  │  - API_DB_FILEPATH=/persist/ │◄─┼─── ConfigMap
+│  │                               │  │
+│  │  Filesystem:                  │  │
+│  │  /persist/ ◄──────┐          │  │
+│  │    └─ db.json     │          │  │
+│  └───────────────────┼──────────┘  │
+│                      │              │
+│  volumes:            │              │
+│  - name: api-volume  │              │
+│    persistentVolumeClaim:           │
+│      claimName: synergychat-api-pvc │
+└──────────────────────┼──────────────┘
+                       │
+        ┌──────────────▼─────────────┐
+        │   PVC (api-pvc.yaml)       │
+        │   Solicita: 1Gi            │
+        └──────────────┬─────────────┘
+                       │
+        ┌──────────────▼─────────────┐
+        │   PV (creado automático)   │
+        │   Disco real de 1Gi        │
+        └────────────────────────────┘
+```
+
+#### Prueba de persistencia
+
+**Comandos para probar:**
+```bash
+# 1. Aplicar cambios
+kubectl apply -f api-configmap.yaml
+kubectl apply -f api-deployment.yaml
+
+# 2. Verificar pods
+kubectl get pods
+
+# 3. Iniciar túnel (si usas Minikube)
+minikube tunnel -c
+
+# 4. Abrir http://synchat.internal/
+# 5. Enviar mensajes en la aplicación
+# 6. Eliminar el pod del API
+kubectl delete pod <api-pod-name>
+
+# 7. Esperar a que Kubernetes cree un nuevo pod
+kubectl get pods
+
+# 8. Refrescar la página del navegador
+# ✅ Los mensajes deberían seguir ahí
+```
+
+**¿Qué sucede cuando eliminas el pod?**
+```
+1. kubectl delete pod <api-pod>
+   └─> El contenedor muere
+       └─> El filesystem efímero se borra
+           └─> PERO el PV sigue existiendo
+
+2. Kubernetes crea un nuevo Pod
+   └─> Lee el mismo Deployment
+       └─> Inyecta las mismas variables del ConfigMap
+           └─> Monta el MISMO PVC (apunta al MISMO PV)
+               └─> La app lee /persist/db.json
+                   └─> ¡Los datos persisten!
+```
+
+#### Ciclo de vida del PV
+
+```
+1. PVC creado → kubectl apply -f api-pvc.yaml
+2. PV creado automáticamente → STATUS: Bound
+3. Pod usa el PVC → Los datos se escriben en el PV
+4. Pod muere → ✅ Los datos persisten en el PV
+5. Nuevo pod monta el mismo PVC → ✅ Los datos siguen ahí
+6. PVC eliminado → kubectl delete pvc synergychat-api-pvc
+7. PV también se elimina → Política Delete (los datos se pierden)
+```
+
+---
+
+### 6.5 Bases de Datos en Kubernetes
+
+**Pregunta común:** "¿Debería alojar mi base de datos PostgreSQL en Kubernetes con un PVC?"
+
+**Respuesta:** Es posible, pero **no siempre es la mejor idea**.
+
+#### Ejemplo: Arquitectura de Boot.dev
+
+**Componentes:**
+- **Web application**: Servida por Cloudflare (podría ser K8s)
+- **Backend microservices**: Todos en Kubernetes (GCP)
+  - API CRUD principal
+  - Bot de Discord
+  - Servicio de compilación Go a WASM
+  - etc.
+- **Base de datos PostgreSQL**: Cloud SQL (GCP) - **Servicio administrado**
+
+#### ¿Por qué usar servicios administrados?
+
+**Trabajo manual si usas DB en Kubernetes:**
+- Crear y configurar volúmenes persistentes
+- Manejar actualizaciones de versión de Postgres
+- Establecer límites de recursos
+- Configurar backups automatizados
+- Configurar alta disponibilidad
+- Monitoreo y alertas
+- Recuperación ante desastres
+
+**Servicios administrados (Cloud SQL, RDS, etc.):**
+- ✅ Backups automáticos
+- ✅ Actualizaciones de versión gestionadas
+- ✅ Alta disponibilidad out-of-the-box
+- ✅ Monitoreo incluido
+- ✅ Escalado simplificado
+- ✅ Recuperación ante desastres
+
+#### ¿Cuándo SÍ usar bases de datos en Kubernetes?
+
+**Casos válidos:**
+- **Deployments no críticos** (telemetría, desarrollo, staging)
+- **Datasets pequeños y estáticos**
+- **Herramientas con soporte integrado**: Grafana, Prometheus
+- **No requieres backups sofisticados**
+- **Ambientes de prueba/desarrollo**
+
+**Ejemplo personal del instructor:**
+> "He desplegado Grafana y Prometheus en Kubernetes, y ambos tienen soporte out-of-the-box para bases de datos dentro del cluster. No me importaba demasiado los backups y actualizaciones automáticas para mis datos de telemetría, y sabía que el conjunto de datos era pequeño y estático."
+
+#### Regla general
+
+**Para bases de datos SQL en producción:**
+- ✅ Usa servicios administrados: Cloud SQL (GCP), RDS (AWS), Azure Database
+- ✅ Menos trabajo de mantenimiento
+- ✅ Más confiable para datos críticos
+
+**Para aplicaciones stateless y microservices:**
+- ✅ Usa Kubernetes
+- ✅ Escala fácilmente
+- ✅ Manejo de tráfico eficiente
+
+---
+
+### 6.6 Resumen de Storage
+
+#### Tipos de almacenamiento en Kubernetes
+
+| Tipo | Persistencia | Uso principal | Cuándo usar |
+|------|--------------|---------------|-------------|
+| **Filesystem efímero** | NO | Default del contenedor | Nunca para datos importantes |
+| **emptyDir** | NO (muere con pod) | Compartir entre contenedores | Cache, procesamiento temporal |
+| **PVC/PV** | SÍ (sobrevive al pod) | Datos persistentes | Archivos, configuraciones, DBs no críticas |
+| **Servicios administrados** | SÍ (externa a K8s) | Bases de datos críticas | PostgreSQL, MySQL en producción |
+
+#### Archivos YAML trabajados en esta sección
+
+**Creados:**
+- `api-pvc.yaml` - PersistentVolumeClaim para el API
+
+**Modificados:**
+- `api-configmap.yaml` - Agregamos `API_DB_FILEPATH`
+- `api-deployment.yaml` - Agregamos volumes y volumeMounts con PVC
+- `crawler-configmap.yaml` - Agregamos `CRAWLER_DB_PATH` y puertos
+- `crawler-deployment.yaml` - Agregamos emptyDir, 3 contenedores
+
+#### Comandos clave
+
+```bash
+# Volúmenes persistentes
+kubectl get pvc                           # Ver PersistentVolumeClaims
+kubectl get pv                            # Ver PersistentVolumes
+kubectl apply -f api-pvc.yaml            # Crear PVC
+kubectl delete pvc <pvc-name>            # Eliminar PVC
+
+# Debugging
+kubectl logs <podname> --all-containers  # Logs de todos los contenedores
+kubectl describe pod <podname>           # Detalles del pod y eventos
+
+# Pods
+kubectl get pods                         # Ver estado (READY muestra X/Y contenedores)
+kubectl delete pod <podname>             # Eliminar pod (K8s lo recrea)
+```
+
+#### Conceptos clave para recordar
+
+1. **Filesystem efímero**: Los datos del contenedor se pierden cuando el pod muere
+2. **emptyDir**: Volumen temporal para compartir datos entre contenedores del mismo pod
+3. **PVC/PV**: Almacenamiento persistente que sobrevive al ciclo de vida del pod
+4. **Aprovisionamiento dinámico**: Kubernetes crea el PV automáticamente cuando creas un PVC
+5. **Access Modes**: Definen cómo los nodos pueden acceder al volumen (RWO, ROX, RWX)
+6. **Escalado por pod vs contenedor**: Múltiples pods (HA) vs múltiples contenedores (recursos compartidos)
+7. **DBs en K8s**: Usar servicios administrados para producción, K8s para casos no críticos
