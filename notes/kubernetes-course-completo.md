@@ -5163,70 +5163,127 @@ kubectl get pod <nombre-pod> -o yaml
 **Acceso:**
 - 🌐 Web: http://synchat.internal
 - 🌐 API: http://synchatapi.internal
+---
+
+## 7. Namespaces
+
+### 7.1 Introducción a Namespaces
+
+Los __Namespaces__ son una forma de aislar recursos del cluster en grupos. Son un poco como directorios en tu computadora, pero en lugar de contener archivos, contienen objetos de Kubernetes.
+
+**Concepto clave:**
+- Cada recurso en Kubernetes tiene un **nombre único**
+- Solo puedes usar un nombre una vez **dentro del mismo namespace**
+- Los namespaces permiten usar el mismo nombre para diferentes recursos, siempre que estén en diferentes namespaces
+
+**Identificador único de un recurso:**
+```
+nombre + namespace = identificador único
+```
+
+**Ejemplo:**
+- `synergychat-api` en namespace `default` ≠ `synergychat-api` en namespace `production`
+- Son dos recursos diferentes
+
+### Namespaces por defecto en Kubernetes
+
+Cuando instalas Kubernetes, se crean varios namespaces automáticamente:
+
+```bash
+kubectl get namespaces
+# o versión corta:
+kubectl get ns
+```
+
+**Namespaces del sistema:**
+
+| Namespace | Descripción | ¿Tocar? |
+|-----------|-------------|---------|
+| `default` | Namespace por defecto para recursos del usuario | ✅ Sí |
+| `kube-system` | Componentes core de Kubernetes (DNS, API, etc.) | ❌ No tocar |
+| `kube-public` | Recursos públicos accesibles por todos | ⚠️ Raramente |
+| `kube-node-lease` | Información de heartbeat de nodos | ❌ No tocar |
+
+**Otros namespaces comunes:**
+- `envoy-gateway-system` - Sistema de Gateway API (Envoy)
+- `kubernetes-dashboard` - Dashboard web de Kubernetes
+
+**Comportamiento por defecto:**
+- Si NO especificas un namespace, los recursos se crean en `default`
+- Hasta ahora, todos tus recursos (api, web, crawler) han estado en `default`
 
 ---
 
-## 6. Storage (Almacenamiento)
+### 7.2 Creando y Usando Namespaces
 
-### 6.1 Filesystem Efímero
+#### Crear un namespace
 
-Por defecto, los archivos en disco dentro de un contenedor son **efímeros**. Esto presenta problemas para aplicaciones que necesitan guardar datos de larga duración entre reinicios (ej: bases de datos, datos de usuarios).
+```bash
+# Crear namespace
+kubectl create ns <nombre>
 
-**Problema principal:**
-- Cuando un pod se elimina, el filesystem se elimina con él
-- Los datos no persisten entre reinicios del pod
+# Ejemplo:
+kubectl create ns crawler
+```
 
-**Razones por las que un pod puede eliminarse:**
-- El nodo en el que corre podría fallar
-- Se publicó una nueva versión de la imagen (actualización de código)
-- Un nuevo nodo fue agregado al cluster y el pod fue reprogramado
-- Eliminación manual con `kubectl delete pod`
+#### Trabajar con recursos en un namespace específico
 
-**Filosofía de Kubernetes:**
-- Los pods deben ser "blank slate" (pizarra en blanco)
-- Esto facilita reproducción y debugging de issues
-- Sin estado desordenado del que preocuparse
+**Ver recursos en un namespace:**
+```bash
+kubectl -n <namespace> get pods
+kubectl -n <namespace> get svc
+kubectl -n <namespace> get configmaps
 
-**Ejemplo inicial:**
+# Ejemplos:
+kubectl -n crawler get pods
+kubectl -n kube-system get pods
+```
+
+**Sin especificar `-n`:**
+```bash
+kubectl get pods  # Busca en 'default'
+```
+
+#### Agregar namespace a recursos YAML
+
+Para que un recurso viva en un namespace específico, agregar `namespace` en `metadata`:
+
 ```yaml
-# api-configmap.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: synergychat-api-configmap
+  name: synergychat-crawler-config
+  namespace: crawler              # ← Especifica el namespace
 data:
-  API_PORT: "8080"
-  API_DB_FILEPATH: "/var/lib/synergychat/api/db.json"  # Filesystem efímero
+  CRAWLER_KEYWORDS: "fantasy,science,fiction,magic,space,adventure"
+  # ... resto de datos
 ```
 
-**Prueba de pérdida de datos:**
-1. Configurar la app para guardar en filesystem
-2. Crear mensajes
-3. Eliminar el pod
-4. Los mensajes desaparecen cuando el nuevo pod inicia
+**Aplicar el recurso:**
+```bash
+kubectl apply -f crawler-configmap.yaml
+```
+
+Si el namespace en el YAML es diferente al namespace donde existe actualmente el recurso, Kubernetes lo **crea** (no actualiza):
+
+```bash
+# Recurso existe en 'default'
+kubectl apply -f crawler-configmap.yaml  # Con namespace: crawler
+# Output: configmap/synergychat-crawler-config created  ← "created" no "configured"
+```
 
 ---
 
-### 6.2 Volúmenes Efímeros (emptyDir)
+### 7.3 Mover Recursos a un Nuevo Namespace
 
-La abstracción de **volume** en Kubernetes resuelve dos problemas principales:
-1. **Persistencia de datos** (temporal o permanente)
-2. **Compartir datos entre contenedores** en el mismo pod
+#### Ejemplo: Mover crawler a su propio namespace
 
-**emptyDir:**
-- Es un volumen **efímero** (se borra cuando el pod muere)
-- Permite **compartir datos entre contenedores** del mismo pod
-- Es un directorio vacío creado cuando el pod inicia
-- Uso principal: colaboración entre contenedores, NO persistencia
+**Paso 1: Crear el namespace**
+```bash
+kubectl create ns crawler
+```
 
-#### Ejemplo: Crawler con 3 contenedores
-
-**Problema a resolver:**
-- Cada crawler almacena datos en memoria
-- Necesitamos que todos los crawlers compartan la misma base de datos
-- Escalar a nivel de contenedor (múltiples contenedores en 1 pod)
-
-**Archivos modificados:**
+**Paso 2: Agregar `namespace: crawler` a todos los recursos del crawler**
 
 ```yaml
 # crawler-configmap.yaml
@@ -5234,11 +5291,9 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: synergychat-crawler-config
+  namespace: crawler              # ← Agregar
 data:
-  CRAWLER_KEYWORDS: "fantasy,science,fiction,magic,space,adventure"
-  CRAWLER_DB_PATH: "/cache/db"        # Ruta compartida
-  CRAWLER_PORT_2: "8081"              # Puerto para contenedor 2
-  CRAWLER_PORT_3: "8082"              # Puerto para contenedor 3
+  # ... datos
 ```
 
 ```yaml
@@ -5247,239 +5302,83 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: synergychat-crawler
+  namespace: crawler              # ← Agregar
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: synergychat-crawler
-  template:
-    metadata:
-      labels:
-        app: synergychat-crawler
-    spec:
-      containers:
-        # Contenedor 1 - usa envFrom
-        - name: synergychat-crawler-1
-          image: bootdotdev/synergychat-crawler:latest
-          envFrom:
-            - configMapRef:
-                name: synergychat-crawler-config
-          volumeMounts:
-            - name: cache-volume
-              mountPath: /cache
-        
-        # Contenedor 2 - usa env individual
-        - name: synergychat-crawler-2
-          image: bootdotdev/synergychat-crawler:latest
-          env:
-            - name: CRAWLER_KEYWORDS
-              valueFrom:
-                configMapKeyRef:
-                  name: synergychat-crawler-config
-                  key: CRAWLER_KEYWORDS
-            - name: CRAWLER_DB_PATH
-              valueFrom:
-                configMapKeyRef:
-                  name: synergychat-crawler-config
-                  key: CRAWLER_DB_PATH
-            - name: CRAWLER_PORT
-              valueFrom:
-                configMapKeyRef:
-                  name: synergychat-crawler-config
-                  key: CRAWLER_PORT_2
-          volumeMounts:
-            - name: cache-volume
-              mountPath: /cache
-        
-        # Contenedor 3 - usa env individual
-        - name: synergychat-crawler-3
-          image: bootdotdev/synergychat-crawler:latest
-          env:
-            - name: CRAWLER_KEYWORDS
-              valueFrom:
-                configMapKeyRef:
-                  name: synergychat-crawler-config
-                  key: CRAWLER_KEYWORDS
-            - name: CRAWLER_DB_PATH
-              valueFrom:
-                configMapKeyRef:
-                  name: synergychat-crawler-config
-                  key: CRAWLER_DB_PATH
-            - name: CRAWLER_PORT
-              valueFrom:
-                configMapKeyRef:
-                  name: synergychat-crawler-config
-                  key: CRAWLER_PORT_3
-          volumeMounts:
-            - name: cache-volume
-              mountPath: /cache
-      
-      # Definición del volumen emptyDir
-      volumes:
-        - name: cache-volume
-          emptyDir: {}
+  # ... resto del spec
 ```
-
-**Conceptos clave:**
-
-**Escalado por Pod vs Escalado por Contenedor:**
-
-| Escalado por POD | Escalado por CONTENEDOR |
-|------------------|-------------------------|
-| Múltiples pods, cada uno con 1 contenedor | 1 pod con múltiples contenedores |
-| Alta disponibilidad (si 1 falla, otros siguen) | Si el pod falla, todos los contenedores mueren |
-| No comparten filesystem local | Comparten el mismo volumen |
-| Pueden estar en diferentes nodos | Todos en el mismo nodo |
-| Ejemplo: Web (3 pods × 1 contenedor) | Ejemplo: Crawler (1 pod × 3 contenedores) |
-
-**Cuándo usar cada estrategia:**
-
-**Escalar por POD (más común):**
-- Alta disponibilidad necesaria
-- Distribuir carga en diferentes nodos
-- No necesitan compartir recursos locales
-- Instancias independientes
-
-**Escalar por CONTENEDOR (menos común):**
-- DEBEN compartir el mismo volumen/disco
-- DEBEN compartir la misma red (localhost)
-- Componentes fuertemente acoplados
-- Sidecar patterns (logging, proxy)
-
-**Problema de puertos compartidos:**
-- Pods comparten el mismo namespace de red
-- No pueden vincularse todos al mismo puerto
-- Solución: cada contenedor usa un puerto diferente (8080, 8081, 8082)
-- Solo el primer puerto se expone vía Service
-
-**Comandos útiles:**
-```bash
-# Ver logs de todos los contenedores en un pod
-kubectl logs <podname> --all-containers
-
-# Ver pods con número de contenedores
-kubectl get pods
-# Columna READY muestra: contenedores_listos/contenedores_totales
-# Ejemplo: 3/3 = 3 contenedores listos de 3 totales
-```
-
----
-
-### 6.3 Volúmenes Persistentes (PVC/PV)
-
-Los **Persistent Volumes** permiten que los datos sobrevivan cuando el pod muere.
-
-#### Conceptos Fundamentales
-
-**Persistent Volume (PV):**
-- Recurso a nivel de **cluster** (no de pod)
-- Es el **almacenamiento real** (disco físico)
-- Se crea por separado del pod y luego se adjunta
-- Similar a un ConfigMap en ese aspecto
-
-**Persistent Volume Claim (PVC):**
-- Es una **solicitud** de almacenamiento
-- Cuando usa aprovisionamiento dinámico, crea automáticamente un PV si no existe uno que coincida
-- El PVC se adjunta al pod, como lo haría un volumen
-
-**Aprovisionamiento:**
-- **Estático**: Creado manualmente por un administrador del cluster
-- **Dinámico**: Creado automáticamente cuando un pod solicita un volumen que no existe
-- **Recomendación**: Usar dinámico (menos trabajo, más flexible, cloud-native)
-
-#### Comparación: emptyDir vs PVC/PV
-
-| Característica | emptyDir | PVC/PV |
-|----------------|----------|---------|
-| **Vida útil** | Muere con el pod | Sobrevive al pod |
-| **Compartir** | Solo dentro del pod | Entre pods (según access mode) |
-| **Uso típico** | Cache temporal | Base de datos, datos de usuario |
-| **Persistencia** | NO | SÍ |
-
-#### Access Modes (Modos de Acceso)
-
-| Modo | Abreviatura | Descripción |
-|------|-------------|-------------|
-| `ReadWriteOnce` | RWO | 1 nodo puede leer/escribir a la vez |
-| `ReadOnlyMany` | ROX | Múltiples nodos solo lectura |
-| `ReadWriteMany` | RWX | Múltiples nodos leer/escribir |
-
-#### Ejemplo: PVC para API
-
-**Archivo creado:**
 
 ```yaml
-# api-pvc.yaml
+# crawler-service.yaml
 apiVersion: v1
-kind: PersistentVolumeClaim
+kind: Service
 metadata:
-  name: synergychat-api-pvc
+  name: crawler-service
+  namespace: crawler              # ← Agregar
 spec:
-  accessModes:
-    - ReadWriteOnce          # 1 nodo puede leer/escribir
-  resources:
-    requests:
-      storage: 1Gi           # Solicita 1 Gigabyte
+  # ... resto del spec
 ```
 
-**Campos explicados:**
-- `kind: PersistentVolumeClaim`: Es una solicitud de almacenamiento
-- `name`: Identificador único para referenciarlo desde pods
-- `accessModes`: Cómo se puede acceder al volumen
-- `storage`: Tamaño solicitado
-
-**Comandos:**
+**Paso 3: Aplicar los recursos**
 ```bash
-# Aplicar el PVC
-kubectl apply -f api-pvc.yaml
-
-# Ver PVCs
-kubectl get pvc
-# Salida:
-# NAME                  STATUS   VOLUME                    CAPACITY   ACCESS MODES
-# synergychat-api-pvc   Bound    pvc-xxxxx...             1Gi        RWO
-
-# Ver PVs (creados automáticamente)
-kubectl get pv
-# Salida:
-# NAME              CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM
-# pvc-xxxxx...      1Gi        RWO            Delete           Bound    default/synergychat-api-pvc
-
-# Eliminar PVC (también elimina el PV con política Delete)
-kubectl delete pvc synergychat-api-pvc
-
-# Verificar eliminación
-kubectl get pvc
-kubectl get pv
+kubectl apply -f crawler-configmap.yaml
+kubectl apply -f crawler-deployment.yaml
+kubectl apply -f crawler-service.yaml
 ```
 
-**Flujo de aprovisionamiento dinámico:**
+**Paso 4: Verificar que están en el nuevo namespace**
+```bash
+kubectl -n crawler get pods
+kubectl -n crawler get svc
+kubectl -n crawler get configmaps
 ```
-1. Creas PVC
-   └─> "Necesito 1Gi de almacenamiento"
 
-2. Kubernetes crea PV automáticamente
-   └─> "Creado: disco de 1Gi en el cluster"
+**Paso 5: Eliminar los recursos viejos del namespace default**
+```bash
+kubectl delete deployment synergychat-crawler
+kubectl delete service crawler-service
+kubectl delete configmap synergychat-crawler-config
+```
 
-3. PVC y PV se enlazan (Bound)
-   └─> STATUS: Bound
-
-4. Pod usa el PVC
-   └─> Los datos se guardan en el PV
+**Paso 6: Verificar que ya no están en default**
+```bash
+kubectl get pods        # No debería aparecer crawler
+kubectl get svc         # No debería aparecer crawler-service
+kubectl get configmaps  # No debería aparecer crawler-config
 ```
 
 ---
 
-### 6.4 Adjuntar Persistencia a Pods
+### 7.4 DNS Intra-Cluster
 
-Para usar un PVC en un pod, necesitamos:
-1. Referenciar el PVC en la sección `volumes` del deployment
-2. Montar el volumen en el contenedor con `volumeMounts`
-3. Configurar la aplicación para usar la ruta montada
+Kubernetes crea automáticamente **entradas DNS** para cada servicio que pueden usarse para enrutar tráfico HTTP entre servicios dentro del cluster.
 
-#### Ejemplo: API con PVC
+#### Formato DNS interno
 
-**Archivos modificados:**
+**Formato completo:**
+```
+<service-name>.<namespace>.svc.cluster.local
+```
+
+**Variantes válidas:**
+```
+# Completo (siempre funciona)
+http://crawler-service.crawler.svc.cluster.local
+
+# Sin .svc.cluster.local (funciona en la mayoría de casos)
+http://crawler-service.crawler
+
+# Solo nombre (solo si están en el MISMO namespace)
+http://crawler-service
+```
+
+#### Ejemplo: API conectándose al Crawler
+
+**Escenario:**
+- `api` en namespace `default`
+- `crawler` en namespace `crawler`
+- `api` necesita hacer HTTP requests al `crawler`
+
+**Solución: Usar DNS interno**
 
 ```yaml
 # api-configmap.yaml
@@ -5489,256 +5388,884 @@ metadata:
   name: synergychat-api-configmap
 data:
   API_PORT: "8080"
-  API_DB_FILEPATH: "/persist/db.json"  # Ruta en el volumen montado
+  API_DB_FILEPATH: "/persist/db.json"
+  CRAWLER_BASE_URL: "http://crawler-service.crawler.svc.cluster.local:80"
 ```
+
+**Desglose de la URL:**
+```
+http://crawler-service.crawler.svc.cluster.local:80
+     ↓                ↓           ↓         ↓       ↓
+  Nombre del      Namespace    Servicio  Dominio Puerto
+  servicio                     interno   cluster
+```
+
+- `crawler-service` → Nombre del Service
+- `crawler` → Namespace donde vive el servicio
+- `svc.cluster.local` → Dominio interno de Kubernetes (estándar)
+- `80` → Puerto del servicio
+
+**Aplicar el ConfigMap:**
+```bash
+kubectl apply -f api-configmap.yaml
+```
+
+**Reiniciar el pod del API para cargar la nueva variable:**
+```bash
+kubectl delete pod <api-pod-name>
+```
+
+#### Flujo de comunicación DNS
+
+```
+┌─────────────────────────────────────────────────┐
+│           NAMESPACE: default                    │
+│                                                 │
+│  ┌──────────────┐                              │
+│  │   API Pod    │                              │
+│  │              │                              │
+│  │ Hace request:│                              │
+│  │ GET http://crawler-service.crawler...      │
+│  └──────┬───────┘                              │
+│         │                                       │
+└─────────┼───────────────────────────────────────┘
+          │
+          │ DNS resuelve a la IP del servicio
+          │
+┌─────────▼───────────────────────────────────────┐
+│           NAMESPACE: crawler                    │
+│                                                 │
+│  ┌──────────────────┐                          │
+│  │ crawler-service  │ (ClusterIP)              │
+│  │ IP: 10.96.x.x    │                          │
+│  └────────┬─────────┘                          │
+│           │                                     │
+│           ├─► Pod crawler (C1, C2, C3)         │
+│           │                                     │
+└───────────┴─────────────────────────────────────┘
+```
+
+**Proceso:**
+1. API hace request a `http://crawler-service.crawler.svc.cluster.local:80`
+2. DNS de Kubernetes resuelve `crawler-service.crawler` a la IP del servicio
+3. El servicio enruta la petición a uno de los pods del crawler
+4. El crawler responde
+5. API recibe la respuesta
+
+#### Debugging de conectividad DNS
+
+**Verificar que la variable esté configurada:**
+```bash
+kubectl exec <api-pod> -- env | grep CRAWLER_BASE_URL
+```
+
+**Probar conectividad desde el pod del API:**
+```bash
+# Entrar al pod
+kubectl exec -it <api-pod> -- sh
+
+# Dentro del pod, resolver DNS
+nslookup crawler-service.crawler.svc.cluster.local
+
+# Probar conexión HTTP
+wget -O- http://crawler-service.crawler.svc.cluster.local:80
+# o
+curl http://crawler-service.crawler.svc.cluster.local:80
+
+# Salir
+exit
+```
+
+---
+
+### 7.5 Comunicación Interna vs Externa
+
+#### Arquitectura de SynergyChat
+
+```
+MUNDO EXTERIOR (Internet)
+        │
+        │ Usuario visita http://synchat.internal
+        ▼
+┌────────────────────────────────────────────────┐
+│            GATEWAY (Punto de entrada)          │
+└────────────────┬───────────────────────────────┘
+                 │
+        ┌────────┴────────┐
+        │                 │
+        ▼                 ▼
+┌─────────────┐    ┌─────────────┐
+│  WEB (UI)   │    │  API (JSON) │ ← ÚNICA API expuesta
+│ (Frontend)  │    │             │
+└─────────────┘    └──────┬──────┘
+                          │
+                          │ Comunicación INTERNA
+                          │ (DNS interno, no sale a Internet)
+                          ▼
+                   ┌─────────────┐
+                   │  CRAWLER    │ ← NO expuesto al exterior
+                   │ (Backend)   │    Solo accesible internamente
+                   └─────────────┘
+```
+
+#### Servicios Expuestos vs Internos
+
+**Servicios EXPUESTOS al exterior:**
+- Tienen un HTTPRoute conectado al Gateway
+- Tienen un dominio público (ej: `synchatapi.internal`)
+- Accesibles desde Internet
 
 ```yaml
-# api-deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
+# Ejemplo: api-httproute.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
-  name: synergychat-api
-  labels:
-    app: synergychat-api
+  name: api-httproute
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: synergychat-api
-  template:
-    metadata:
-      labels:
-        app: synergychat-api
-    spec:
-      containers:
-      - name: synergychat-api
-        image: bootdotdev/synergychat-api:latest
-        envFrom:
-          - configMapRef:
-              name: synergychat-api-configmap
-        volumeMounts:
-          - name: synergychat-api-volume    # Nombre local
-            mountPath: /persist              # Ruta en el contenedor
-      volumes:
-        - name: synergychat-api-volume      # Nombre local
-          persistentVolumeClaim:
-            claimName: synergychat-api-pvc  # Referencia al PVC
+  parentRefs:
+    - name: app-gateway        # ← Conectado al Gateway
+  hostnames:
+    - "synchatapi.internal"    # ← Dominio PÚBLICO
+  rules:
+    - backendRefs:
+        - name: api-service
 ```
 
-#### Interacción entre archivos
+**Resultado:** `Internet → Gateway → API` ✅
 
-**Flujo de conexión:**
+**Servicios INTERNOS (no expuestos):**
+- NO tienen HTTPRoute al Gateway
+- NO tienen dominio público
+- Solo accesibles dentro del cluster
+
+**Resultado:** `Internet → Gateway → Crawler` ❌
+
+Pero dentro del cluster:
 ```
-ConfigMap (api-configmap.yaml)
-  └─> Define: API_DB_FILEPATH="/persist/db.json"
-      └─> Le dice a la app: "guarda datos aquí"
-
-PVC (api-pvc.yaml)
-  └─> Solicita: 1Gi de almacenamiento
-      └─> Kubernetes crea PV automáticamente
-
-Deployment (api-deployment.yaml)
-  └─> Carga variables del ConfigMap
-  └─> Referencia el PVC en volumes
-  └─> Monta el volumen en /persist
-      └─> La app escribe en /persist/db.json
-          └─> Los datos van al PV (disco real)
+API → crawler-service.crawler.svc.cluster.local ✅
 ```
 
-**Diagrama de conexiones:**
-```
-┌─────────────────────────────────────┐
-│         DEPLOYMENT                  │
-│  ┌──────────────────────────────┐  │
-│  │    CONTAINER (api)           │  │
-│  │  Variables de entorno:       │  │
-│  │  - API_DB_FILEPATH=/persist/ │◄─┼─── ConfigMap
-│  │                               │  │
-│  │  Filesystem:                  │  │
-│  │  /persist/ ◄──────┐          │  │
-│  │    └─ db.json     │          │  │
-│  └───────────────────┼──────────┘  │
-│                      │              │
-│  volumes:            │              │
-│  - name: api-volume  │              │
-│    persistentVolumeClaim:           │
-│      claimName: synergychat-api-pvc │
-└──────────────────────┼──────────────┘
-                       │
-        ┌──────────────▼─────────────┐
-        │   PVC (api-pvc.yaml)       │
-        │   Solicita: 1Gi            │
-        └──────────────┬─────────────┘
-                       │
-        ┌──────────────▼─────────────┐
-        │   PV (creado automático)   │
-        │   Disco real de 1Gi        │
-        └────────────────────────────┘
-```
+#### Ventajas de la Comunicación Interna
 
-#### Prueba de persistencia
+**1. Velocidad**
+- Comunicación dentro de la red interna del cluster
+- Latencia: 1-5 ms
+- No sale del datacenter
 
-**Comandos para probar:**
-```bash
-# 1. Aplicar cambios
-kubectl apply -f api-configmap.yaml
-kubectl apply -f api-deployment.yaml
+vs.
 
-# 2. Verificar pods
-kubectl get pods
+- Comunicación externa: 50-200 ms
+- Sale y entra del datacenter
 
-# 3. Iniciar túnel (si usas Minikube)
-minikube tunnel -c
+**2. Seguridad**
+- No expone servicios internos a Internet
+- Reduce superficie de ataque
+- No necesita HTTPS (la red interna ya es segura)
 
-# 4. Abrir http://synchat.internal/
-# 5. Enviar mensajes en la aplicación
-# 6. Eliminar el pod del API
-kubectl delete pod <api-pod-name>
+**3. Simplicidad**
+- No requiere DNS público para cada servicio
+- No requiere configurar HTTPRoutes para cada servicio
+- Un solo punto de entrada (Gateway/API)
 
-# 7. Esperar a que Kubernetes cree un nuevo pod
-kubectl get pods
+#### Flujo de comunicación: Comando /stats
 
-# 8. Refrescar la página del navegador
-# ✅ Los mensajes deberían seguir ahí
-```
-
-**¿Qué sucede cuando eliminas el pod?**
-```
-1. kubectl delete pod <api-pod>
-   └─> El contenedor muere
-       └─> El filesystem efímero se borra
-           └─> PERO el PV sigue existiendo
-
-2. Kubernetes crea un nuevo Pod
-   └─> Lee el mismo Deployment
-       └─> Inyecta las mismas variables del ConfigMap
-           └─> Monta el MISMO PVC (apunta al MISMO PV)
-               └─> La app lee /persist/db.json
-                   └─> ¡Los datos persisten!
-```
-
-#### Ciclo de vida del PV
+**Usuario escribe `/stats`:**
 
 ```
-1. PVC creado → kubectl apply -f api-pvc.yaml
-2. PV creado automáticamente → STATUS: Bound
-3. Pod usa el PVC → Los datos se escriben en el PV
-4. Pod muere → ✅ Los datos persisten en el PV
-5. Nuevo pod monta el mismo PVC → ✅ Los datos siguen ahí
-6. PVC eliminado → kubectl delete pvc synergychat-api-pvc
-7. PV también se elimina → Política Delete (los datos se pierden)
+1. Usuario → WEB (http://synchat.internal)
+   ↓
+2. WEB → API (http://synchatapi.internal) - EXTERNA
+   ↓
+3. API → Crawler (http://crawler-service.crawler) - INTERNA
+   ↓
+4. Crawler responde a API
+   ↓
+5. API responde a WEB
+   ↓
+6. WEB muestra respuesta al usuario
 ```
+
+**Puntos clave:**
+- El usuario NUNCA habla directamente con el Crawler
+- El usuario SOLO habla con WEB y API (expuestos)
+- API internamente coordina con Crawler (interno)
+- Crawler está protegido detrás del API
 
 ---
 
-### 6.5 Bases de Datos en Kubernetes
+### 7.6 Resumen de Namespaces
 
-**Pregunta común:** "¿Debería alojar mi base de datos PostgreSQL en Kubernetes con un PVC?"
+#### Conceptos clave
 
-**Respuesta:** Es posible, pero **no siempre es la mejor idea**.
+| Concepto | Descripción |
+|----------|-------------|
+| **Namespace** | Agrupación lógica de recursos en Kubernetes |
+| **Identificador único** | `nombre + namespace` |
+| **default** | Namespace por defecto si no se especifica otro |
+| **kube-system** | Namespace del sistema (no tocar) |
+| **DNS interno** | `<service>.<namespace>.svc.cluster.local` |
+| **Comunicación interna** | Más rápida, segura y simple que externa |
 
-#### Ejemplo: Arquitectura de Boot.dev
+#### Cuándo usar namespaces
 
-**Componentes:**
-- **Web application**: Servida por Cloudflare (podría ser K8s)
-- **Backend microservices**: Todos en Kubernetes (GCP)
-  - API CRUD principal
-  - Bot de Discord
-  - Servicio de compilación Go a WASM
-  - etc.
-- **Base de datos PostgreSQL**: Cloud SQL (GCP) - **Servicio administrado**
+**Usar namespaces separados cuando:**
+- Equipos diferentes trabajan en diferentes servicios
+- Entornos diferentes (dev, staging, production)
+- Necesitas aislamiento de recursos
+- Quieres organizar un cluster grande
 
-#### ¿Por qué usar servicios administrados?
-
-**Trabajo manual si usas DB en Kubernetes:**
-- Crear y configurar volúmenes persistentes
-- Manejar actualizaciones de versión de Postgres
-- Establecer límites de recursos
-- Configurar backups automatizados
-- Configurar alta disponibilidad
-- Monitoreo y alertas
-- Recuperación ante desastres
-
-**Servicios administrados (Cloud SQL, RDS, etc.):**
-- ✅ Backups automáticos
-- ✅ Actualizaciones de versión gestionadas
-- ✅ Alta disponibilidad out-of-the-box
-- ✅ Monitoreo incluido
-- ✅ Escalado simplificado
-- ✅ Recuperación ante desastres
-
-#### ¿Cuándo SÍ usar bases de datos en Kubernetes?
-
-**Casos válidos:**
-- **Deployments no críticos** (telemetría, desarrollo, staging)
-- **Datasets pequeños y estáticos**
-- **Herramientas con soporte integrado**: Grafana, Prometheus
-- **No requieres backups sofisticados**
-- **Ambientes de prueba/desarrollo**
-
-**Ejemplo personal del instructor:**
-> "He desplegado Grafana y Prometheus en Kubernetes, y ambos tienen soporte out-of-the-box para bases de datos dentro del cluster. No me importaba demasiado los backups y actualizaciones automáticas para mis datos de telemetría, y sabía que el conjunto de datos era pequeño y estático."
-
-#### Regla general
-
-**Para bases de datos SQL en producción:**
-- ✅ Usa servicios administrados: Cloud SQL (GCP), RDS (AWS), Azure Database
-- ✅ Menos trabajo de mantenimiento
-- ✅ Más confiable para datos críticos
-
-**Para aplicaciones stateless y microservices:**
-- ✅ Usa Kubernetes
-- ✅ Escala fácilmente
-- ✅ Manejo de tráfico eficiente
-
----
-
-### 6.6 Resumen de Storage
-
-#### Tipos de almacenamiento en Kubernetes
-
-| Tipo | Persistencia | Uso principal | Cuándo usar |
-|------|--------------|---------------|-------------|
-| **Filesystem efímero** | NO | Default del contenedor | Nunca para datos importantes |
-| **emptyDir** | NO (muere con pod) | Compartir entre contenedores | Cache, procesamiento temporal |
-| **PVC/PV** | SÍ (sobrevive al pod) | Datos persistentes | Archivos, configuraciones, DBs no críticas |
-| **Servicios administrados** | SÍ (externa a K8s) | Bases de datos críticas | PostgreSQL, MySQL en producción |
-
-#### Archivos YAML trabajados en esta sección
-
-**Creados:**
-- `api-pvc.yaml` - PersistentVolumeClaim para el API
-
-**Modificados:**
-- `api-configmap.yaml` - Agregamos `API_DB_FILEPATH`
-- `api-deployment.yaml` - Agregamos volumes y volumeMounts con PVC
-- `crawler-configmap.yaml` - Agregamos `CRAWLER_DB_PATH` y puertos
-- `crawler-deployment.yaml` - Agregamos emptyDir, 3 contenedores
+**Un solo namespace (default) es suficiente cuando:**
+- Cluster pequeño
+- Pocos servicios
+- Un solo equipo
 
 #### Comandos clave
 
 ```bash
-# Volúmenes persistentes
-kubectl get pvc                           # Ver PersistentVolumeClaims
-kubectl get pv                            # Ver PersistentVolumes
-kubectl apply -f api-pvc.yaml            # Crear PVC
-kubectl delete pvc <pvc-name>            # Eliminar PVC
+# Ver y crear namespaces
+kubectl get namespaces
+kubectl get ns                        # Versión corta
+kubectl create ns <nombre>
+
+# Trabajar con recursos en namespaces
+kubectl -n <namespace> get pods
+kubectl -n <namespace> get svc
+kubectl -n <namespace> get configmaps
+kubectl -n <namespace> describe pod <pod-name>
+kubectl -n <namespace> logs <pod-name>
+
+# Eliminar recursos en namespace
+kubectl -n <namespace> delete pod <pod-name>
 
 # Debugging
-kubectl logs <podname> --all-containers  # Logs de todos los contenedores
-kubectl describe pod <podname>           # Detalles del pod y eventos
-
-# Pods
-kubectl get pods                         # Ver estado (READY muestra X/Y contenedores)
-kubectl delete pod <podname>             # Eliminar pod (K8s lo recrea)
+kubectl exec <pod> -- env | grep VARIABLE
+kubectl exec -it <pod> -- sh
+nslookup <service>.<namespace>.svc.cluster.local
 ```
 
-#### Conceptos clave para recordar
+#### Archivos YAML modificados
 
-1. **Filesystem efímero**: Los datos del contenedor se pierden cuando el pod muere
-2. **emptyDir**: Volumen temporal para compartir datos entre contenedores del mismo pod
-3. **PVC/PV**: Almacenamiento persistente que sobrevive al ciclo de vida del pod
-4. **Aprovisionamiento dinámico**: Kubernetes crea el PV automáticamente cuando creas un PVC
-5. **Access Modes**: Definen cómo los nodos pueden acceder al volumen (RWO, ROX, RWX)
-6. **Escalado por pod vs contenedor**: Múltiples pods (HA) vs múltiples contenedores (recursos compartidos)
-7. **DBs en K8s**: Usar servicios administrados para producción, K8s para casos no críticos
+**Para mover recursos a un namespace:**
+
+```yaml
+metadata:
+  name: <nombre-recurso>
+  namespace: <nombre-namespace>  # ← Agregar esta línea
+```
+
+**Archivos modificados en esta sección:**
+- `crawler-configmap.yaml` - agregamos `namespace: crawler`
+- `crawler-deployment.yaml` - agregamos `namespace: crawler`
+- `crawler-service.yaml` - agregamos `namespace: crawler`
+- `api-configmap.yaml` - agregamos `CRAWLER_BASE_URL`
+
+#### Patrones de comunicación
+
+**Mismo namespace:**
+```yaml
+CRAWLER_BASE_URL: "http://crawler-service"
+```
+
+**Diferentes namespaces:**
+```yaml
+CRAWLER_BASE_URL: "http://crawler-service.crawler"
+# o completo:
+CRAWLER_BASE_URL: "http://crawler-service.crawler.svc.cluster.local"
+```
+
+**Con puerto específico:**
+```yaml
+CRAWLER_BASE_URL: "http://crawler-service.crawler.svc.cluster.local:80"
+```
+
+#### Arquitectura recomendada
+
+**Para producción:**
+```
+Gateway (único punto de entrada)
+    ↓
+Servicios públicos (API, WEB) - Expuestos
+    ↓
+Servicios internos (Crawler, DB, etc.) - NO expuestos
+```
+
+**Ventajas:**
+- ✅ Seguridad (menos superficie de ataque)
+- ✅ Simplicidad (menos configuración)
+- ✅ Performance (comunicación interna rápida)
+
+---
+
+## 8. Observability & Resource Management
+
+### 8.1 Métricas con kubectl top
+
+Para poder monitorear el uso de recursos (CPU y memoria) de los pods, necesitamos habilitar el addon `metrics-server` en Minikube.
+
+#### Habilitar metrics-server
+
+```bash
+minikube addons enable metrics-server
+```
+
+Este addon despliega un pod en el namespace `kube-system` que recolecta métricas de todos los nodos y pods del cluster.
+
+#### Verificar el metrics-server
+
+```bash
+kubectl -n kube-system get pod
+```
+
+Deberías ver un pod llamado `metrics-server-xxxxx`. Espera a que esté en estado `Running`.
+
+#### Comando kubectl top
+
+Similar al comando `top` de Unix/Linux, `kubectl top` muestra el uso de recursos en tiempo real.
+
+**Ver métricas de pods:**
+```bash
+kubectl top pod
+```
+
+**Salida esperada:**
+```
+NAME                               CPU(cores)   MEMORY(bytes)
+synergychat-api-76b796b58d-x5wpk   1m           14Mi
+synergychat-web-846d86c444-d9c8q   1m           15Mi
+synergychat-web-846d86c444-sk6n4   1m           15Mi
+synergychat-web-846d86c444-w2pqg   1m           15Mi
+```
+
+**Ver métricas de nodos:**
+```bash
+kubectl top node
+```
+
+**Interpretación:**
+- `1m` = 1 milli-core = 0.001 cores = 0.1% de un CPU core
+- `14Mi` = 14 mebibytes = ~14.7 megabytes
+
+**Nota:** Puede tomar 1-2 minutos después de habilitar metrics-server para que las métricas estén disponibles.
+
+---
+
+### 8.2 Escalado Vertical vs Horizontal
+
+Hay dos formas principales de escalar una aplicación en Kubernetes:
+
+#### Escalado Vertical (Scale Up)
+
+**Definición:** Aumentar los recursos (CPU, RAM) de cada nodo o pod individual.
+
+**Ejemplo:**
+```
+Servidor original:
+- CPU: 2 cores
+- RAM: 4 GB
+- Capacidad: 1000 req/s
+
+Después de escalar verticalmente:
+- CPU: 8 cores     ← Más recursos
+- RAM: 16 GB       ← Más recursos
+- Capacidad: 4000 req/s
+```
+
+**Analogía:** Contratar a un trabajador MÁS CAPACITADO en lugar de contratar más trabajadores.
+
+**Ventajas:**
+- Simplicidad (menos instancias que gestionar)
+- Menor latencia de red entre componentes
+
+**Desventajas:**
+- ❌ Límite físico del hardware (no puedes crecer infinitamente)
+- ❌ Punto único de falla (si el nodo muere, todo se cae)
+- ❌ Más costoso (hardware de gama alta es exponencialmente más caro)
+
+#### Escalado Horizontal (Scale Out)
+
+**Definición:** Aumentar el número de nodos o pods (réplicas).
+
+**Ejemplo:**
+```
+Configuración original:
+2 servidores × (2 cores, 4GB) = 2000 req/s
+
+Después de escalar horizontalmente:
+4 servidores × (2 cores, 4GB) = 4000 req/s
+```
+
+**Analogía:** Contratar MÁS trabajadores en lugar de capacitar más a los existentes.
+
+**Ventajas:**
+- ✅ Alta disponibilidad (si un nodo falla, otros continúan)
+- ✅ Distribución geográfica (nodos en diferentes datacenters)
+- ✅ Sin límite teórico (puedes agregar nodos indefinidamente)
+- ✅ Más económico (hardware commodity es más barato)
+
+**Desventajas:**
+- Más complejo de gestionar
+- Requiere arquitectura distribuida
+
+#### Comparación Visual
+
+**Vertical:**
+```
+1 POD                          1 POD (mejorado)
+┌─────────────┐               ┌─────────────┐
+│ CPU: 0.5    │               │ CPU: 2.0    │
+│ RAM: 1 GB   │  ──────►      │ RAM: 4 GB   │
+└─────────────┘               └─────────────┘
+```
+
+**Horizontal:**
+```
+1 POD                         3 PODS
+┌─────────────┐               ┌─────────┐ ┌─────────┐ ┌─────────┐
+│ CPU: 0.5    │               │ 0.5 CPU │ │ 0.5 CPU │ │ 0.5 CPU │
+│ RAM: 1 GB   │  ──────►      │ 1 GB    │ │ 1 GB    │ │ 1 GB    │
+└─────────────┘               └─────────┘ └─────────┘ └─────────┘
+```
+
+#### Escalado en Kubernetes
+
+**A nivel de POD:**
+```yaml
+# Vertical: aumentar recursos del pod
+resources:
+  limits:
+    cpu: "2"      # Era 0.5
+    memory: "4Gi" # Era 1Gi
+
+# Horizontal: aumentar réplicas
+replicas: 5  # Era 1
+```
+
+**A nivel de NODO:**
+```bash
+# Vertical: comprar nodos más grandes
+# Antes: 3 nodos × (4 cores, 16GB)
+# Después: 3 nodos × (16 cores, 64GB)
+
+# Horizontal: agregar más nodos
+# Antes: 3 nodos × (4 cores, 16GB)
+# Después: 6 nodos × (4 cores, 16GB)
+```
+
+#### Regla general en Kubernetes
+
+**En Kubernetes, es generalmente mejor escalar horizontalmente.**
+
+**Razones:**
+- Kubernetes está diseñado para gestionar múltiples réplicas
+- Alta disponibilidad automática
+- Load balancing integrado
+- Más alineado con arquitecturas cloud-native
+
+---
+
+### 8.3 Resource Limits - CPU
+
+En un entorno de producción, es fundamental establecer límites de recursos para evitar que un pod acapare todos los recursos de un nodo y "sofoque" a los demás pods.
+
+#### ¿Por qué establecer límites?
+
+**Sin límites:**
+```
+┌───────────────────────────────┐
+│   Nodo (8 cores totales)      │
+│                               │
+│  Pod A: 🔥🔥🔥🔥🔥🔥🔥 (7 cores) │ ← Acapara todo
+│  Pod B: 💤 (sin recursos)    │ ← Sofocado
+│  Pod C: 💤 (sin recursos)    │ ← Sofocado
+└───────────────────────────────┘
+```
+
+**Con límites:**
+```
+┌───────────────────────────────┐
+│   Nodo (8 cores totales)      │
+│                               │
+│  Pod A: 🔥 (1 core límite)   │ ← Limitado
+│  Pod B: ✅ (1 core)          │ ← Funciona
+│  Pod C: ✅ (1 core)          │ ← Funciona
+│  Libre: 5 cores              │
+└───────────────────────────────┘
+```
+
+#### Sintaxis de límites de CPU
+
+```yaml
+spec:
+  containers:
+    - name: my-container
+      image: my-image
+      resources:
+        limits:
+          cpu: "<max-cpu>"
+```
+
+**Unidades de CPU:**
+
+| Valor | Significado | Equivalente |
+|-------|-------------|-------------|
+| `1` | 1 core completo | 1000m |
+| `500m` | Medio core | 0.5 cores |
+| `100m` | Un décimo de core | 0.1 cores |
+| `50m` | 5% de un core | 0.05 cores |
+| `1m` | 0.1% de un core | 0.001 cores |
+
+**`m` = milli-cores**
+
+#### Ejemplo práctico: testcpu
+
+**Aplicación de prueba:**
+- Imagen: `bootdotdev/synergychat-testcpu:latest`
+- Comportamiento: Consume toda la CPU disponible (loop infinito)
+
+**Deployment con límite de 50m:**
+
+```yaml
+# testcpu-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: synergychat-testcpu
+  name: synergychat-testcpu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: synergychat-testcpu
+  template:
+    metadata:
+      labels:
+        app: synergychat-testcpu
+    spec:
+      containers:
+        - image: bootdotdev/synergychat-testcpu:latest
+          name: synergychat-testcpu
+          resources:
+            limits:
+              cpu: "50m"
+```
+
+**Aplicar y verificar:**
+```bash
+kubectl apply -f testcpu-deployment.yaml
+kubectl get pods
+kubectl top pod
+```
+
+**Resultado esperado:**
+```
+NAME                                  CPU(cores)   MEMORY(bytes)
+synergychat-testcpu-xxxxxxxxx-xxxxx   50m          10Mi
+```
+
+El pod está usando exactamente **50m** (o muy cerca) porque Kubernetes está **limitando (throttling)** el pod.
+
+#### Throttling de CPU
+
+**Comportamiento:**
+- El pod intenta usar TODA la CPU disponible
+- Kubernetes limita la velocidad a 50m
+- El pod continúa funcionando pero MÁS LENTO
+- NO se mata el pod, solo se reduce su velocidad
+
+**Flujo:**
+```
+Pod: "Quiero usar 8 cores"
+    ↓
+Kubernetes: "Solo puedes usar 50m (0.05 cores)"
+    ↓
+Pod: Funciona a velocidad reducida ⏱️
+```
+
+---
+
+### 8.4 Resource Limits - Memory
+
+Los límites de memoria funcionan de manera diferente a los de CPU.
+
+#### Diferencia clave: CPU vs Memory
+
+| Aspecto | CPU | Memory |
+|---------|-----|--------|
+| **Si excede límite** | Throttling (más lento) | OOMKilled (pod muere) |
+| **Pod sigue vivo** | ✅ Sí | ❌ No (se reinicia) |
+| **Comportamiento** | Limita velocidad | Termina el proceso |
+
+#### Sintaxis de límites de memoria
+
+```yaml
+spec:
+  containers:
+    - name: my-container
+      image: my-image
+      resources:
+        limits:
+          memory: "<max-memory>"
+          cpu: "<max-cpu>"
+```
+
+**Unidades de memoria:**
+
+| Valor | Significado | Notas |
+|-------|-------------|-------|
+| `128974848` | 128974848 bytes | Poco legible |
+| `129M` | 129 megabytes (decimal) | Base 10 |
+| `123Mi` | 123 mebibytes (binario) | **Recomendado** |
+| `1Gi` | 1 gibibyte | **Recomendado** |
+| `1G` | 1 gigabyte (decimal) | Base 10 |
+
+**Diferencia Mi vs M:**
+- `1Mi` = 1024 KiB = 1,048,576 bytes (binario)
+- `1M` = 1000 KB = 1,000,000 bytes (decimal)
+
+**Recomendación:** Usa `Mi` (mebibytes) y `Gi` (gibibytes) en Kubernetes.
+
+#### Ejemplo práctico: testram
+
+**Aplicación de prueba:**
+- Imagen: `bootdotdev/synergychat-testram:latest`
+- Comportamiento: Asigna X megabytes de memoria según variable de entorno
+- Variable: `MEGABYTES` (configurable vía ConfigMap)
+
+**ConfigMap:**
+
+```yaml
+# testram-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: synergychat-testram-configmap
+data:
+  MEGABYTES: "200"
+```
+
+**Deployment con límite de 256Mi:**
+
+```yaml
+# testram-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: synergychat-testram
+  name: synergychat-testram
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: synergychat-testram
+  template:
+    metadata:
+      labels:
+        app: synergychat-testram
+    spec:
+      containers:
+        - image: bootdotdev/synergychat-testram:latest
+          name: synergychat-testram
+          envFrom:
+            - configMapRef:
+                name: synergychat-testram-configmap
+          resources:
+            limits:
+              memory: "256Mi"
+```
+
+**Aplicar y verificar:**
+```bash
+kubectl apply -f testram-configmap.yaml
+kubectl apply -f testram-deployment.yaml
+kubectl get pods
+kubectl top pod
+```
+
+**Resultado esperado:**
+```
+NAME                                  CPU(cores)   MEMORY(bytes)
+synergychat-testram-xxxxxxxxx-xxxxx   1m           205Mi
+```
+
+El pod está usando aproximadamente **200-210Mi** de memoria (según configuración en ConfigMap).
+
+#### OOMKilled - Out Of Memory Killed
+
+**¿Qué pasa si el pod excede el límite de memoria?**
+
+Si cambias `MEGABYTES: "300"` (excede el límite de 256Mi):
+
+```bash
+kubectl apply -f testram-configmap.yaml
+kubectl delete pod <testram-pod-name>
+kubectl get pods
+```
+
+Verás:
+```
+NAME                                  READY   STATUS      RESTARTS   AGE
+synergychat-testram-xxxxxxxxx-xxxxx   0/1     OOMKilled   1          1m
+```
+
+**OOMKilled** = Out Of Memory Killed
+
+**Flujo:**
+```
+Pod intenta asignar 300Mi
+    ↓
+Límite: 256Mi
+    ↓
+300Mi > 256Mi
+    ↓
+Kubernetes: "Límite excedido"
+    ↓
+Pod MUERE 💀
+    ↓
+Kubernetes lo REINICIA automáticamente
+    ↓
+Ciclo se repite (CrashLoopBackOff)
+```
+
+**Ver detalles:**
+```bash
+kubectl describe pod <testram-pod-name>
+```
+
+En `Last State` verás:
+```
+Reason: OOMKilled
+Exit Code: 137
+```
+
+#### ¿Por qué testram necesita ConfigMap?
+
+**testcpu:**
+- Simplemente consume CPU al máximo (loop infinito)
+- No necesita configuración
+- Kubernetes la limita con throttling
+
+**testram:**
+- Necesita saber CUÁNTA memoria asignar
+- Lee la variable `MEGABYTES` del ConfigMap
+- Asigna exactamente esa cantidad
+
+**Pseudo-código:**
+```python
+# testcpu
+while True:
+    do_computation()  # Consume CPU
+
+# testram
+megabytes = int(os.getenv("MEGABYTES"))
+data = allocate_memory(megabytes)  # Necesita saber cuánto
+```
+
+---
+
+### 8.5 Resumen de Observability & Resource Management
+
+#### Comandos clave
+
+```bash
+# Habilitar métricas
+minikube addons enable metrics-server
+
+# Ver métricas
+kubectl top pod
+kubectl top node
+kubectl top pod -n <namespace>
+
+# Ver recursos de pods
+kubectl get pods
+kubectl describe pod <pod-name>
+
+# Aplicar recursos de prueba
+kubectl apply -f testcpu-deployment.yaml
+kubectl apply -f testram-configmap.yaml
+kubectl apply -f testram-deployment.yaml
+
+# Limpiar recursos de prueba
+kubectl delete deployment synergychat-testcpu
+kubectl delete deployment synergychat-testram
+kubectl delete configmap synergychat-testram-configmap
+```
+
+#### Conceptos clave
+
+| Concepto | Descripción |
+|----------|-------------|
+| **Escalado Vertical** | Aumentar recursos por nodo/pod (scale up) |
+| **Escalado Horizontal** | Aumentar número de nodos/pods (scale out) |
+| **Resource Limits** | Límites máximos de CPU y memoria |
+| **Throttling** | Limitar velocidad de CPU (pod sigue vivo) |
+| **OOMKilled** | Matar pod que excede límite de memoria |
+| **Milli-core (m)** | 1/1000 de un CPU core |
+| **Mebibyte (Mi)** | 1024 KiB (binario, recomendado) |
+
+#### Patrones de límites
+
+**Límite solo de CPU:**
+```yaml
+resources:
+  limits:
+    cpu: "500m"
+```
+
+**Límite solo de memoria:**
+```yaml
+resources:
+  limits:
+    memory: "512Mi"
+```
+
+**Ambos límites (recomendado en producción):**
+```yaml
+resources:
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+```
+
+#### Comportamiento de límites
+
+**CPU:**
+- Excede límite → Throttling (funciona más lento)
+- Pod sigue vivo
+- No se reinicia
+
+**Memory:**
+- Excede límite → OOMKilled (pod muere)
+- Pod se reinicia automáticamente
+- Puede entrar en CrashLoopBackOff
+
+#### Archivos creados en esta sección
+
+**Creados:**
+- `testcpu-deployment.yaml` - Pod de prueba de CPU con límite 50m
+- `testram-configmap.yaml` - ConfigMap con MEGABYTES: "200"
+- `testram-deployment.yaml` - Pod de prueba de memoria con límite 256Mi
+
+#### Best Practices
+
+**En producción:**
+1. ✅ Siempre establecer resource limits
+2. ✅ Monitorear con `kubectl top` regularmente
+3. ✅ Escalar horizontalmente cuando sea posible
+4. ✅ Usar `Mi` y `Gi` para memoria (no `M` o `G`)
+5. ✅ Establecer límites realistas basados en métricas reales
+6. ⚠️ No establecer límites demasiado bajos (causa throttling/OOMKilled)
+7. ⚠️ No dejar pods sin límites (pueden ahogar a otros pods)
+
+#### Escalado recomendado en Kubernetes
+
+**Para la mayoría de casos:**
+- ✅ Escalado horizontal (más réplicas)
+- ✅ Nodos de tamaño medio (no muy grandes)
+- ✅ Alta disponibilidad automática
+
+**Solo usar escalado vertical cuando:**
+- Aplicación no puede distribuirse (legacy)
+- Limitaciones de licenciamiento
+- Requisitos de latencia extremadamente bajos
