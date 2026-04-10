@@ -48,6 +48,27 @@
 31. [Gateway Types y Annotations](#31-gateway-types-y-annotations)
 32. [Conectando Frontend y API](#32-conectando-frontend-y-api)
 
+### Sección 6 - Storage (Almacenamiento)
+- Storage en Kubernetes
+- emptyDir - Almacenamiento Temporal
+- Persistent Volumes (PV) y Persistent Volume Claims (PVC)
+- Storage Classes
+- Configuración de almacenamiento para SynergyChat
+
+### Sección 7 - Namespaces
+- Namespaces - Organización Lógica
+- Creación y gestión de namespaces
+- DNS interno entre namespaces
+- Migración del Crawler a namespace dedicado
+- Comunicación cross-namespace
+
+### Sección 8 - Observability & Resource Management
+- Metrics Server - Monitoreo de recursos
+- Resource Requests - Reserva de recursos
+- Resource Limits - CPU y Memory
+- Breaking the Limits - Pruebas de límites
+- Horizontal Pod Autoscaling (HPA)
+
 ### Referencia
 33. [Consultas Teóricas Frecuentes](#33-consultas-teóricas-frecuentes)
 34. [Glosario de Términos](#34-glosario-de-términos)
@@ -6269,3 +6290,722 @@ resources:
 - Aplicación no puede distribuirse (legacy)
 - Limitaciones de licenciamiento
 - Requisitos de latencia extremadamente bajos
+
+---
+
+### 8.4 Breaking the Limits - Pruebas de Límites de Memoria
+
+#### Concepto
+
+**Diferencia entre CPU y Memory:**
+- **CPU:** Las aplicaciones no "eligen" cuánta CPU usar - van tan rápido como pueden. Si se excede el límite, Kubernetes hace **throttling** (el pod va más lento pero sigue vivo)
+- **Memory:** Las aplicaciones asignan memoria activamente. Si se excede el límite, el pod **crashea** (OOMKilled - Out Of Memory Killed)
+
+**Esta subsección prueba el comportamiento de límites de memoria.**
+
+#### Ejercicio: Exceder el límite de memoria
+
+**Objetivo:** Configurar testram para que intente asignar más memoria de la permitida y observar el crash.
+
+**Pasos realizados:**
+
+1. **Actualizar ConfigMap de testram:**
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: testram-config
+   data:
+     MEGABYTES: "500"  # 500 MB
+   ```
+
+2. **Aplicar cambios:**
+   ```bash
+   kubectl apply -f testram-configmap.yaml
+   kubectl delete pod <testram-pod-name>  # Para que tome la nueva variable
+   ```
+
+3. **Verificar el crash:**
+   ```bash
+   kubectl get pods
+   # Output: STATUS: CrashLoopBackOff o OOMKilled
+   
+   kubectl describe pod <testram-pod-name>
+   ```
+
+**Salida esperada del describe:**
+```
+Containers:
+  synergychat-testram:
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+```
+
+#### ¿Qué está pasando?
+
+**Análisis del crash:**
+- Aplicación intenta asignar: **500 MB** (`MEGABYTES=500`)
+- Límite del contenedor: **256 Mi** (en `testram-deployment.yaml`)
+- **500 MB > 256 Mi** → Excede el límite
+- Kubernetes mata el proceso: **OOMKilled** (Out Of Memory Killed)
+- Exit Code: **137** = señal de terminación por OOM (128 + 9)
+- Kubernetes intenta reiniciar automáticamente → **CrashLoopBackOff**
+
+**CrashLoopBackOff:**
+- Kubernetes detecta que el pod crashea repetidamente
+- Aumenta el tiempo entre reintentos (backoff exponencial)
+- Patrón: 0s → 10s → 20s → 40s → 80s → hasta 5 minutos máximo
+
+#### Comandos clave
+
+```bash
+# Ver estado de pods
+kubectl get pods
+
+# Describir pod para ver motivo del crash
+kubectl describe pod <testram-pod-name>
+
+# Ver logs del pod (antes del crash)
+kubectl logs <testram-pod-name>
+
+# Ver eventos recientes
+kubectl get events --sort-by='.lastTimestamp'
+```
+
+---
+
+### 8.5 Fix the Limits - Arreglar los Límites
+
+#### Concepto
+
+Después de probar el crash por exceso de memoria, restauramos la aplicación testram a un estado saludable para no tener pods constantemente crasheando ni consumiendo recursos excesivos.
+
+#### Ejercicio: Reducir el uso de memoria
+
+**Objetivo:** Configurar testram para que use solo 10 MB de memoria (dentro del límite de 256 Mi).
+
+**Pasos realizados:**
+
+1. **Actualizar ConfigMap de testram:**
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: testram-config
+   data:
+     MEGABYTES: "10"  # Solo 10 MB
+   ```
+
+2. **Aplicar cambios:**
+   ```bash
+   kubectl apply -f testram-configmap.yaml
+   kubectl delete pod <testram-pod-name>
+   ```
+
+3. **Verificar que el pod está saludable:**
+   ```bash
+   kubectl get pods
+   # Output: STATUS: Running, READY: 1/1
+   
+   kubectl top pods
+   # Output: testram usando ~10Mi de memoria
+   ```
+
+#### Comparación: Antes vs Después
+
+**Antes (MEGABYTES=500):**
+- Intenta asignar: 500 MB
+- Límite: 256 Mi
+- Resultado: **OOMKilled** ❌
+- Estado: CrashLoopBackOff
+
+**Ahora (MEGABYTES=10):**
+- Asigna: 10 MB
+- Límite: 256 Mi
+- Resultado: **Running** ✅
+- Estado: Saludable, sin reinicios
+
+#### Verificación
+
+```bash
+# Ver estado del pod
+kubectl get pods
+# Esperado: Running, READY 1/1, RESTARTS 0
+
+# Ver uso de recursos
+kubectl top pods
+# Esperado: testram usando ~10Mi de memoria
+
+# Describir pod (opcional)
+kubectl describe pod <testram-pod-name>
+# Esperado: State: Running, Ready: True, Restart Count: 0
+```
+
+---
+
+### 8.6 Horizontal Pod Autoscaling (HPA) - Escalado Automático
+
+#### Concepto
+
+**Horizontal Pod Autoscaler (HPA):**
+- Escala automáticamente el **número de pods** en un Deployment basándose en métricas observadas
+- Métrica principal: **Utilización de CPU** (también soporta métricas personalizadas)
+- Objetivo: Mantener la utilización promedio de CPU en el valor objetivo configurado
+
+**¿Cómo funciona?**
+1. HPA monitorea cada 15 segundos las métricas de los pods
+2. Calcula el promedio de utilización de CPU: `uso_actual / request * 100`
+3. Compara con el objetivo (`targetCPUUtilizationPercentage`)
+4. **Si promedio > objetivo:** Crea más pods (scale up)
+5. **Si promedio < objetivo:** Elimina pods (scale down)
+
+**Algoritmo básico:**
+```
+desired_replicas = ceil(current_replicas * (current_cpu / target_cpu))
+```
+
+#### Ejercicio 1: HPA para testcpu (alta CPU)
+
+**Objetivo:** Configurar HPA para testcpu que consume mucha CPU, observar el escalado hacia arriba.
+
+**Archivos creados/modificados:**
+
+1. **testcpu-deployment.yaml** (modificado - sin replicas):
+   ```yaml
+   apiVersion: apps/v1
+   kind: Deployment
+   metadata:
+     labels:
+       app: synergychat-testcpu
+     name: synergychat-testcpu
+   spec:
+     selector:
+       matchLabels:
+         app: synergychat-testcpu
+     template:
+       metadata:
+         labels:
+           app: synergychat-testcpu
+       spec:
+         containers:
+           - image: bootdotdev/synergychat-testcpu:latest
+             name: synergychat-testcpu
+             resources:
+               requests:
+                 cpu: 100m
+               limits:
+                 cpu: 200m
+   ```
+   **Nota importante:** Se eliminó `replicas: 1` para que el HPA tenga control total.
+
+2. **testcpu-hpa.yaml** (creado):
+   ```yaml
+   apiVersion: autoscaling/v1
+   kind: HorizontalPodAutoscaler
+   metadata:
+     name: testcpu-hpa
+   spec:
+     scaleTargetRef:
+       apiVersion: apps/v1
+       kind: Deployment
+       name: synergychat-testcpu
+     minReplicas: 1
+     maxReplicas: 4
+     targetCPUUtilizationPercentage: 50
+   ```
+
+**Pasos realizados:**
+
+```bash
+# 1. Editar deployment (eliminar replicas)
+nano testcpu-deployment.yaml
+kubectl apply -f testcpu-deployment.yaml
+
+# 2. Crear y aplicar HPA
+nano testcpu-hpa.yaml
+kubectl apply -f testcpu-hpa.yaml
+
+# 3. Monitorear el escalado
+kubectl get hpa
+kubectl get pods
+kubectl top pods
+
+# 4. Ver detalles del HPA
+kubectl describe hpa testcpu-hpa
+```
+
+**Resultados observados:**
+
+```bash
+# HPA en acción
+kubectl get hpa
+NAME          REFERENCE                        TARGETS    MINPODS   MAXPODS   REPLICAS
+testcpu-hpa   Deployment/synergychat-testcpu   100%/50%   1         4         4
+
+# Pods escalando
+kubectl get pods
+NAME                                   READY   STATUS    RESTARTS   AGE
+synergychat-testcpu-xxxxxxxxxx-xxxxx   1/1     Running   0          5m
+synergychat-testcpu-xxxxxxxxxx-yyyyy   1/1     Running   0          3m
+synergychat-testcpu-xxxxxxxxxx-zzzzz   1/1     Running   0          3m
+synergychat-testcpu-xxxxxxxxxx-wwwww   1/1     Running   0          2m
+```
+
+**¿Por qué escaló a 4 pods?**
+- Cada pod usa ~50m de CPU (cerca del límite de 50m original o 200m después)
+- Request: 100m
+- Utilización: 50m / 100m = **50%** (o más si el límite es bajo)
+- Como la utilización está en o por encima del 50% objetivo, el HPA crea más pods para distribuir la carga
+- Escala hasta `maxReplicas: 4`
+
+#### Ejercicio 2: HPA para web (baja CPU)
+
+**Objetivo:** Configurar HPA para web que consume poca CPU, observar que mantiene el mínimo de pods.
+
+**Archivos creados/modificados:**
+
+1. **web-deployment.yaml** (modificado - agregar resources, sin replicas):
+   ```yaml
+   apiVersion: apps/v1
+   kind: Deployment
+   metadata:
+     name: synergychat-web
+     labels:
+       app: synergychat-web
+   spec:
+     selector:
+       matchLabels:
+         app: synergychat-web
+     template:
+       metadata:
+         labels:
+           app: synergychat-web
+       spec:
+         containers:
+         - name: synergychat-web
+           image: docker.io/bootdotdev/synergychat-web:latest
+           ports:
+           - containerPort: 8080
+           envFrom:
+           - configMapRef:
+               name: synergychat-web-configmap
+           resources:
+             requests:
+               cpu: 10m
+               memory: 20Mi
+             limits:
+               cpu: 50m
+               memory: 100Mi
+   ```
+   **Cambios:** Agregado `resources` (critical para HPA), eliminado `replicas: 3`.
+
+2. **web-hpa.yaml** (creado):
+   ```yaml
+   apiVersion: autoscaling/v1
+   kind: HorizontalPodAutoscaler
+   metadata:
+     name: web-hpa
+   spec:
+     scaleTargetRef:
+       apiVersion: apps/v1
+       kind: Deployment
+       name: synergychat-web
+     minReplicas: 1
+     maxReplicas: 4
+     targetCPUUtilizationPercentage: 50
+   ```
+
+**Pasos realizados:**
+
+```bash
+# 1. Editar deployment (agregar resources, eliminar replicas)
+nano web-deployment.yaml
+kubectl apply -f web-deployment.yaml
+
+# 2. Crear HPA (copiar desde testcpu-hpa.yaml)
+cp testcpu-hpa.yaml web-hpa.yaml
+nano web-hpa.yaml  # Cambiar nombre y deployment target
+kubectl apply -f web-hpa.yaml
+
+# 3. Esperar 1-2 minutos para métricas
+kubectl get hpa
+
+# 4. Esperar ~5 minutos para escalado hacia abajo
+kubectl get pods
+kubectl top pods
+```
+
+**Resultados observados:**
+
+```bash
+# HPA después de 2 minutos
+kubectl get hpa
+NAME          REFERENCE                        TARGETS    MINPODS   MAXPODS   REPLICAS
+web-hpa       Deployment/synergychat-web       10%/50%    1         4         3
+
+# Después de 5 minutos (scale down completo)
+kubectl get hpa
+NAME          REFERENCE                        TARGETS    MINPODS   MAXPODS   REPLICAS
+web-hpa       Deployment/synergychat-web       10%/50%    1         4         1
+
+# Un solo pod de web
+kubectl get pods
+NAME                                   READY   STATUS    RESTARTS   AGE
+synergychat-web-xxxxxxxxxx-xxxxx       1/1     Running   0          5m
+```
+
+**¿Por qué solo 1 pod?**
+- Cada pod de web usa ~1m de CPU
+- Request: 10m
+- Utilización: 1m / 10m = **10%**
+- Como 10% < 50% objetivo, el HPA reduce pods al mínimo: `minReplicas: 1`
+
+#### Ejercicio 3: HPA Fix - Reducir consumo de testcpu
+
+**Objetivo:** Reducir el consumo de recursos de testcpu para no saturar la máquina.
+
+**Archivos modificados:**
+
+1. **testcpu-deployment.yaml** (actualizado con límites bajos):
+   ```yaml
+   apiVersion: apps/v1
+   kind: Deployment
+   metadata:
+     labels:
+       app: synergychat-testcpu
+     name: synergychat-testcpu
+   spec:
+     selector:
+       matchLabels:
+         app: synergychat-testcpu
+     template:
+       metadata:
+         labels:
+           app: synergychat-testcpu
+       spec:
+         containers:
+           - image: bootdotdev/synergychat-testcpu:latest
+             name: synergychat-testcpu
+             resources:
+               requests:
+                 cpu: 10m
+               limits:
+                 cpu: 10m
+   ```
+   **Cambios:** `limits.cpu: 10m`, `requests.cpu: 10m`
+
+2. **testcpu-hpa.yaml** (actualizado con maxReplicas: 1):
+   ```yaml
+   apiVersion: autoscaling/v1
+   kind: HorizontalPodAutoscaler
+   metadata:
+     name: testcpu-hpa
+   spec:
+     scaleTargetRef:
+       apiVersion: apps/v1
+       kind: Deployment
+       name: synergychat-testcpu
+     minReplicas: 1
+     maxReplicas: 1
+     targetCPUUtilizationPercentage: 50
+   ```
+   **Cambio:** `maxReplicas: 1` (forzar solo 1 pod)
+
+**Pasos realizados:**
+
+```bash
+# 1. Actualizar deployment
+nano testcpu-deployment.yaml
+kubectl apply -f testcpu-deployment.yaml
+
+# 2. Actualizar HPA
+nano testcpu-hpa.yaml
+kubectl apply -f testcpu-hpa.yaml
+
+# 3. Observar el scale down (rápido porque maxReplicas=1)
+kubectl get pods
+# Los pods extras pasan a Terminating inmediatamente
+
+kubectl get hpa
+# REPLICAS baja de 4 a 1 rápidamente
+```
+
+**Resultados:**
+
+```bash
+# Antes
+kubectl get hpa
+testcpu-hpa   Deployment/synergychat-testcpu   100%/50%   1   4   4
+
+kubectl top pods
+testcpu-xxxxx   50m   6Mi
+testcpu-yyyyy   50m   6Mi
+testcpu-zzzzz   50m   6Mi
+testcpu-wwwww   50m   6Mi
+# Total CPU: ~200m
+
+# Después
+kubectl get hpa
+testcpu-hpa   Deployment/synergychat-testcpu   10%/50%   1   1   1
+
+kubectl get pods
+testcpu-xxxxx   1/1   Running   0   1m
+# Total CPU: ~10m
+
+# Reducción: De ~200m a ~10m = 95% menos CPU
+```
+
+**¿Por qué el scale down fue rápido?**
+- Normalmente el HPA tarda ~5 minutos en escalar hacia abajo (para evitar "flapping")
+- **PERO** con `maxReplicas: 1`, el HPA está **forzado** a mantener máximo 1 pod
+- Viola la restricción con 4 pods → elimina pods extras **inmediatamente**
+- No espera el período de cooldown normal
+
+#### Requisito crítico para HPA
+
+**El HPA NECESITA `resources.requests.cpu` en el Deployment:**
+
+```yaml
+resources:
+  requests:
+    cpu: 10m  # REQUERIDO para HPA
+  limits:
+    cpu: 50m
+```
+
+**Sin `requests.cpu`:**
+```bash
+kubectl get hpa
+NAME      REFERENCE         TARGETS              MINPODS   MAXPODS   REPLICAS
+web-hpa   Deployment/web    cpu: <unknown>/50%   1         4         0
+```
+
+**Con `requests.cpu`:**
+```bash
+kubectl get hpa
+NAME      REFERENCE         TARGETS    MINPODS   MAXPODS   REPLICAS
+web-hpa   Deployment/web    10%/50%    1         4         1
+```
+
+**¿Por qué?**
+- HPA calcula utilización: `uso_actual / request * 100`
+- Sin `request` → no puede calcular el porcentaje → `<unknown>`
+
+#### Regla de Kubernetes: Requests ≤ Limits
+
+**Válido:**
+```yaml
+requests:
+  cpu: 10m
+limits:
+  cpu: 10m    # 10m <= 10m ✅
+
+requests:
+  cpu: 100m
+limits:
+  cpu: 200m   # 100m <= 200m ✅
+```
+
+**Inválido:**
+```yaml
+requests:
+  cpu: 100m
+limits:
+  cpu: 10m    # 100m > 10m ❌
+
+# Error: must be less than or equal to cpu limit
+```
+
+#### Tiempos de escalado del HPA
+
+**Scale Up (crear pods):**
+- Tiempo: ~30 segundos - 1 minuto
+- Razón: Responder rápido a aumento de carga
+
+**Scale Down (eliminar pods):**
+- Tiempo: ~5 minutos
+- Razón: Evitar "flapping" (escalado constante arriba/abajo)
+- Excepción: Violación de `maxReplicas` → inmediato
+
+**Frecuencia de verificación:**
+- HPA revisa métricas cada **15 segundos**
+
+#### Archivos creados en esta subsección
+
+**Creados:**
+- `testcpu-hpa.yaml` - HPA para testcpu (min: 1, max: 4 inicialmente, luego max: 1)
+- `web-hpa.yaml` - HPA para web (min: 1, max: 4)
+
+**Modificados:**
+- `testcpu-deployment.yaml` - Eliminado replicas, agregado/ajustado resources
+- `web-deployment.yaml` - Eliminado replicas, agregado resources
+- `testram-configmap.yaml` - MEGABYTES: 500 → 10
+
+#### Comandos clave de HPA
+
+```bash
+# Ver todos los HPAs
+kubectl get hpa
+
+# Ver HPA específico con métricas actualizadas
+kubectl get hpa <hpa-name>
+
+# Describir HPA (ver eventos de escalado)
+kubectl describe hpa <hpa-name>
+
+# Monitoreo continuo (actualiza cada 2 segundos)
+watch kubectl get hpa
+watch kubectl get pods
+watch kubectl top pods
+
+# Eliminar HPA
+kubectl delete hpa <hpa-name>
+```
+
+#### Conceptos clave aprendidos
+
+**HPA vs Réplicas fijas:**
+- **Réplicas fijas:** `replicas: 3` en Deployment → siempre 3 pods
+- **HPA:** Número de pods **dinámico** basado en métricas → entre minReplicas y maxReplicas
+
+**Alta CPU → Scale Up:**
+- testcpu: 100% CPU → HPA crea más pods → distribuye la carga
+
+**Baja CPU → Scale Down:**
+- web: 10% CPU → HPA reduce a minReplicas → ahorra recursos
+
+**Configuración óptima:**
+- Establecer `minReplicas` según carga mínima esperada
+- Establecer `maxReplicas` según capacidad del clúster
+- Ajustar `targetCPUUtilizationPercentage` según tipo de aplicación:
+  - **50-70%**: Aplicaciones con carga variable (recomendado)
+  - **30-50%**: Aplicaciones críticas (más margen)
+  - **70-90%**: Aplicaciones batch (maximizar recursos)
+
+#### Best Practices para HPA
+
+**Configuración:**
+1. ✅ Siempre eliminar `replicas` del Deployment (dejar control total al HPA)
+2. ✅ Establecer `requests.cpu` en el Deployment (requerido)
+3. ✅ Configurar `minReplicas >= 1` (alta disponibilidad)
+4. ✅ Establecer `maxReplicas` basado en capacidad del clúster
+5. ✅ Target 50-70% para la mayoría de aplicaciones
+
+**Monitoreo:**
+1. ✅ Usar `kubectl top pods` para verificar uso real
+2. ✅ Revisar eventos del HPA: `kubectl describe hpa`
+3. ✅ Monitorear frecuencia de scaling (evitar flapping)
+
+**Evitar:**
+1. ❌ No establecer `minReplicas: 0` (aplicación no disponible si no hay tráfico)
+2. ❌ No establecer target muy bajo (<30%) - desperdicio de recursos
+3. ❌ No establecer target muy alto (>90%) - riesgo de saturación
+4. ❌ No olvidar `requests.cpu` - HPA no funcionará
+
+---
+
+## Resumen de la Sección 8: Observability & Resource Management
+
+### Temas Cubiertos
+
+1. **Metrics Server** - Instalación y verificación del sistema de métricas
+2. **Resource Requests** - Reserva garantizada de recursos (CPU y memoria)
+3. **Resource Limits - CPU** - Límites máximos de CPU (throttling)
+4. **Resource Limits - Memory** - Límites máximos de memoria (OOMKilled)
+5. **Breaking the Limits** - Pruebas de exceso de límites de memoria
+6. **Fix the Limits** - Restauración a configuración saludable
+7. **Horizontal Pod Autoscaling (HPA)** - Escalado automático basado en métricas
+
+### Puntos Clave
+
+#### Metrics Server
+- Sistema de monitoreo de recursos en Kubernetes
+- Requerido para `kubectl top` y HPA
+- Comando: `kubectl top pods`, `kubectl top nodes`
+
+#### Resource Requests
+- **Garantía mínima** de recursos reservados
+- Scheduler usa requests para decidir dónde ubicar pods
+- No evita que el pod use más (si está disponible)
+
+#### Resource Limits
+- **Máximo absoluto** de recursos que puede usar un pod
+- **CPU:** Exceso → throttling (va más lento, no muere)
+- **Memory:** Exceso → OOMKilled (pod muere, Exit Code 137)
+
+#### Unidades
+- **CPU:** milli-cores (m) - 1000m = 1 CPU core
+- **Memory:** Mi (mebibytes) o Gi (gibibytes) - binarios, recomendados
+
+#### HPA (Horizontal Pod Autoscaler)
+- Escala número de pods automáticamente
+- Basado en utilización de CPU (o métricas custom)
+- Requiere `requests.cpu` en Deployment
+- Scale up: ~30s-1min, Scale down: ~5min
+- Formula: `desired = ceil(current * (actual/target))`
+
+### Archivos Creados
+
+**Deployments:**
+- `testcpu-deployment.yaml` - Pod de prueba de CPU
+- `testram-deployment.yaml` - Pod de prueba de memoria
+- `web-deployment.yaml` - Actualizado con resources
+
+**ConfigMaps:**
+- `testram-configmap.yaml` - Variable MEGABYTES para testram
+
+**HPAs:**
+- `testcpu-hpa.yaml` - Autoscaler para testcpu
+- `web-hpa.yaml` - Autoscaler para web
+
+### Comandos Importantes
+
+```bash
+# Monitoreo de recursos
+kubectl top pods
+kubectl top nodes
+
+# Gestión de HPA
+kubectl get hpa
+kubectl describe hpa <hpa-name>
+kubectl delete hpa <hpa-name>
+
+# Debugging
+kubectl describe pod <pod-name>
+kubectl logs <pod-name>
+kubectl get events --sort-by='.lastTimestamp'
+```
+
+### Conceptos Críticos
+
+**Requests vs Limits:**
+```
+Requests ≤ Uso Real ≤ Limits
+```
+
+**Comportamiento de límites:**
+- CPU: Throttling (más lento)
+- Memory: OOMKilled (muerte del pod)
+
+**HPA Targets:**
+```
+Utilización = (uso_actual / request) * 100%
+```
+
+**Escalado en Kubernetes:**
+- ✅ Preferir: Horizontal (más pods)
+- ⚠️ Evitar: Vertical (pods más grandes)
+
+### Lecciones Aprendidas
+
+1. **Siempre establecer resource limits en producción**
+2. **HPA requiere `requests.cpu` para funcionar**
+3. **Memoria OOMKilled → crashea, CPU throttle → lento**
+4. **Escalado horizontal > escalado vertical en K8s**
+5. **HPA necesita tiempo (métricas cada 15s, scale down ~5min)**
+6. **Requests ≤ Limits (regla de oro)**
+
+---

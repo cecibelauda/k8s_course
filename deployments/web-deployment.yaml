@@ -5,7 +5,6 @@ metadata:
   labels:
     app: synergychat-web
 spec:
-  replicas: 3
   selector:
     matchLabels:
       app: synergychat-web
@@ -22,3 +21,10 @@ spec:
         envFrom:
         - configMapRef:
             name: synergychat-web-configmap
+        resources:
+          requests:
+            cpu: 10m
+            memory: 20Mi
+          limits:
+            cpu: 50m
+            memory: 100Mi
